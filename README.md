@@ -80,17 +80,6 @@ python3 main.py
 
 ---
 
-## “Linux noob” explanation: apt vs pip
-
-- **apt** installs OS packages (Qt, PyQt5, HackRF tools, drivers, etc.)
-- **pip** installs Python libraries (like `numpy`) into your venv
-
-On DragonOS/Linux we use:
-- **apt for PyQt5** (reliable on ARM)
-- **pip for a small set of Python-only deps**
-
----
-
 ## Troubleshooting (Linux)
 
 ### `ModuleNotFoundError: No module named 'PyQt5'`
@@ -131,4 +120,5 @@ git checkout v1.3
 
 ## License
 MIT (see `LICENSE`)
+
 
