@@ -7,7 +7,7 @@ It supports running multiple SDRs at once (example: 2× HackRF + 1× bladeRF), e
 ## Supported platforms
 
 ### ✅ Officially supported (v1.3)
-- **DragonOS Pi64 / Debian-based Linux on Raspberry Pi 5**
+- **DragonOS Pi64 / Debian-based Linux on Raspberry Pi 5** (and similar Debian-based Linux)
 
 ### ⚠️ Windows (possible, not the main target)
 Windows can work, but SDR drivers + Soapy stacks have a lot of gotchas.  
@@ -15,13 +15,47 @@ A guide is included here: `docs/install-windows.md`. If you get stuck, open an i
 
 ---
 
-## Quick start (DragonOS Pi64 / Debian-based Linux)
+## Quick start (DragonOS / Debian / Raspberry Pi OS)
 
-### 1) Install system dependencies (APT)
+### Option A (recommended): “Professional” installer
+
+This is the easiest path and is what most users should do:
+
+```bash
+sudo apt update
+sudo apt install -y git
+
+cd ~
+git clone https://github.com/Gang1eri/Watchdog.git
+cd Watchdog
+
+chmod +x install_dragonos.sh
+./install_dragonos.sh
+```
+
+After install, launch **Watchdog** from your app menu (search “Watchdog”), or run:
+
+```bash
+cd ~/Watchdog
+source .venv/bin/activate
+python3 main.py
+```
+
+Update later:
+
+```bash
+cd ~/Watchdog
+git pull
+./install_dragonos.sh
+```
+
+### Option B: Manual install (advanced / troubleshooting)
+
+Use this only if you want to understand each step or you’re troubleshooting.
+
+#### 1) Install system dependencies (APT)
 
 On Debian/DragonOS/Raspberry Pi OS, we install **PyQt5 via apt** (not pip) for best compatibility.
-
-Update + install packages:
 
 ```bash
 sudo apt update
@@ -37,7 +71,7 @@ python3 -c "from PyQt5 import QtWidgets; print('PyQt5 OK')"
 python3 -c "from PyQt5.QtMultimedia import QSoundEffect; print('QtMultimedia OK')"
 ```
 
-### 2) Clone this repo
+#### 2) Clone the repo
 
 ```bash
 cd ~
@@ -45,14 +79,11 @@ git clone https://github.com/Gang1eri/Watchdog.git
 cd Watchdog
 ```
 
-### 3) Create a Python venv (IMPORTANT on Linux)
+#### 3) Create a venv (IMPORTANT on Linux)
 
-Because PyQt5 is installed with **apt** (system-wide), your virtual environment must be created with
-`--system-site-packages` or you may see:
+Because PyQt5 is installed with **apt** (system-wide), your venv must include system site-packages or you may see:
 
 `ModuleNotFoundError: No module named 'PyQt5'`
-
-Create + activate the venv:
 
 ```bash
 python3 -m venv .venv --system-site-packages
@@ -60,19 +91,13 @@ source .venv/bin/activate
 python -m pip install -U pip
 ```
 
-### 4) Install Python (pip) dependencies
-
-This repo keeps **pip-only** dependencies separate from system packages.
-
-On DragonOS/Linux:
+#### 4) Install pip dependencies
 
 ```bash
 pip install -r requirements-debian.txt
 ```
 
-(Yes, the file is short on purpose: the big GUI pieces come from apt.)
-
-### 5) Run
+#### 5) Run
 
 ```bash
 python3 main.py
@@ -80,9 +105,22 @@ python3 main.py
 
 ---
 
+## Desktop launcher (Linux)
+
+If you used `./install_dragonos.sh`, the desktop launcher is installed automatically.
+
+If you want to verify it:
+
+```bash
+ls -l ~/.local/share/applications/watchdog.desktop
+```
+
+---
+
 ## Troubleshooting (Linux)
 
 ### `ModuleNotFoundError: No module named 'PyQt5'`
+
 Fix (install system PyQt5 + recreate venv correctly):
 
 ```bash
@@ -97,6 +135,7 @@ python3 main.py
 ```
 
 ### HackRF permission issues
+
 If `hackrf_info` requires sudo, you may need udev rules. See:
 - `docs/install-pi-bookworm.md`
 
@@ -120,5 +159,3 @@ git checkout v1.3
 
 ## License
 MIT (see `LICENSE`)
-
-
