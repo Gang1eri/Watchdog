@@ -74,7 +74,7 @@ python -m pip install -U pip
 Install Python deps:
 
 ```bash
-pip install -r requirements-pi.txt
+pip install -r requirements-debian.txt
 ```
 
 Run:
@@ -91,3 +91,4 @@ This repo includes Linux launcher assets under `packaging/linux/`.
 - `packaging/linux/HackRF-Watchdog.desktop`
 
 **Note:** edit `Exec=` and `Path=` in the `.desktop` file to match your username and install folder.
+
