@@ -17,7 +17,7 @@ A guide is included here: `docs/install-windows.md`. If you get stuck, open an i
 
 ## Quick start (DragonOS / Debian / Raspberry Pi OS)
 
-### Option A (recommended): “Professional” installer
+### Option A (recommended):
 
 This is the easiest path and is what most users should do:
 
@@ -159,3 +159,4 @@ git checkout v1.3
 
 ## License
 MIT (see `LICENSE`)
+
