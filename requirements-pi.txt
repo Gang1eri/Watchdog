@@ -2,10 +2,6 @@
 
 These steps are tested on Debian-based Raspberry Pi images (Raspberry Pi OS Bookworm 64-bit, DragonOS Pi64, etc.).
 
-**Why apt + venv?**
-- We install **PyQt5 via `apt`** (most reliable on ARM / Debian).
-- We use a Python **venv** for pip-only dependencies.
-
 ---
 
 ## 1) Update OS + install system packages (APT)
@@ -35,8 +31,6 @@ python3 -c "from PyQt5.QtMultimedia import QSoundEffect; print('QtMultimedia OK'
 ---
 
 ## 2) Clone Watchdog
-
-If the repo is private, `git clone` will prompt for credentials. Use a GitHub **Personal Access Token** as the password.
 
 ```bash
 cd ~
@@ -116,3 +110,4 @@ python3 main.py
 
 ### HackRF permission issues
 If `hackrf_info` only works with `sudo`, you may need udev rules for HackRF access.
+
