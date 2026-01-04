@@ -67,7 +67,7 @@ This repo keeps **pip-only** dependencies separate from system packages.
 On DragonOS/Linux:
 
 ```bash
-pip install -r requirements-pi.txt
+pip install -r requirements-debian.txt
 ```
 
 (Yes, the file is short on purpose: the big GUI pieces come from apt.)
@@ -103,7 +103,7 @@ deactivate 2>/dev/null || true
 rm -rf .venv
 python3 -m venv .venv --system-site-packages
 source .venv/bin/activate
-pip install -r requirements-pi.txt
+pip install -r requirements-debian.txt
 python3 main.py
 ```
 
@@ -131,3 +131,4 @@ git checkout v1.3
 
 ## License
 MIT (see `LICENSE`)
+
