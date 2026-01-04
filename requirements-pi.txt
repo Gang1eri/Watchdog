@@ -1,3 +1,0 @@
-# Raspberry Pi OS: install PyQt5 via apt (python3-pyqt5 + python3-pyqt5.qtmultimedia)
-# Keep only pip-installed, cross-platform dependencies here:
-numpy
