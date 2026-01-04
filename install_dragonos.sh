@@ -76,6 +76,7 @@ Terminal=false
 Categories=Utility;
 EOF
 
+
 chmod +x "$APP_DIR/watchdog.desktop"
 
 echo ""
