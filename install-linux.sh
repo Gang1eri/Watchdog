@@ -50,7 +50,7 @@ else
 fi
 
 APT="sudo apt-get"
-$APT update -y >/dev/null || true
+$APT update >/dev/null || true
 
 apt_install_one() {
   local pkg="$1"
@@ -90,9 +90,23 @@ echo "[Watchdog] Installing system dependencies (apt)..."
 # Core deps:
 apt_install_list   git   python3 python3-venv python3-pip   python3-pyqt5 python3-pyqt5.qtmultimedia   python3-pyqtgraph || true
 
-# HackRF tools: try 'hackrf' then fallback to 'hackrf-tools'
-if ! apt_install_one hackrf; then
-  apt_install_one hackrf-tools || echo "[Watchdog] WARN: Could not install hackrf or hackrf-tools (HackRF features may not work)."
+# HackRF tools:
+# - If hackrf_sweep already exists (common on DragonOS via /usr/local), don't fight the system packages.
+# - Otherwise try distro packages (name varies).
+if command -v hackrf_sweep >/dev/null 2>&1; then
+  echo "[Watchdog] hackrf_sweep already present ($(command -v hackrf_sweep)); skipping apt HackRF install."
+else
+  if apt_install_one hackrf; then
+    :
+  else
+    # Some Debian-based distros used to ship hackrf-tools; Ubuntu typically doesn't.
+    if apt-cache show hackrf-tools >/dev/null 2>&1; then
+      apt_install_one hackrf-tools || true
+    fi
+    if ! command -v hackrf_sweep >/dev/null 2>&1; then
+      echo "[Watchdog] WARN: Could not install HackRF tools (hackrf_sweep not found). HackRF features may not work."
+    fi
+  fi
 fi
 
 # Optional bladeRF packages (best-effort)
