@@ -185,12 +185,12 @@ python3 main.py
 
 ### HackRF permission issues
 If `hackrf_info` requires sudo, you may need udev rules. See:
-- `docs/install-pi-bookworm.md`
+- `docs/install-debian-pi.md`
 
 ---
 
 ## Docs
-- Linux / Raspberry Pi OS Bookworm: `docs/install-pi-bookworm.md`
+- Linux / Raspberry Pi OS Bookworm: `docs/install-debian-pi.md`
 - Windows (not the main target): `docs/install-windows.md`
 
 ---
