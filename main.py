@@ -56,7 +56,10 @@ from PyQt5.QtMultimedia import QSoundEffect
 from hackrf_watchdog.sweep_backend import iter_sweep_frames, SweepBackendError
 from hackrf_watchdog.atak_bridge import AtakBridge, AtakBridgeWindow
 
-
+try:
+    from hackrf_watchdog.cf_tuner import CenterFrequencyTunerWindow
+except Exception:
+    CenterFrequencyTunerWindow = None
 
 # ---------------------------------------------------------------------------
 # WATCHDOG MULTI-SDR STEP1 (UI-only, no behavior change by default)
@@ -498,7 +501,18 @@ class SweepWorker(QtCore.QObject):
 
             while self._running:
                 enabled_bands = [b for b in self.bands if b.get("enabled")]
-                use_continuous_hackrf = bool(self.device_arg) and len(enabled_bands) == 1
+                # HackRF scanning is intended to be continuous. In Single SDR mode, sweeping multiple
+                # disjoint bands continuously would require sweeping the full union span (often huge),
+                # so we limit each HackRF worker to ONE enabled band.
+                bands_to_scan = enabled_bands
+                if len(enabled_bands) > 1:
+                    self.log_message.emit(
+                        "Note: Continuous HackRF sweep supports one enabled band per HackRF worker. "
+                        "Using the first enabled band only."
+                    )
+                    bands_to_scan = [enabled_bands[0]]
+                use_continuous_hackrf = True if bands_to_scan else False
+
 
                 # Interval behavior:
                 #   - Continuous HackRF mode (single band per HackRF worker): hackrf_sweep stays open.
@@ -530,7 +544,7 @@ class SweepWorker(QtCore.QObject):
                 cycle_start = time.time()
                 any_band = False
 
-                for band in self.bands:
+                for band in bands_to_scan:
                     if not self._running:
                         break
                     if not band.get("enabled"):
@@ -1293,6 +1307,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.atak_window.show()
         self.atak_bridge.status_changed.connect(lambda s: self.append_log(f"ATAK: {s}"))
 
+        # Center Frequency (CF) tuner window (popup)
+        self.cf_tuner_window = None
+
         self.worker_thread: Optional[QtCore.QThread] = None
         self.worker: Optional[SweepWorker] = None
 
@@ -1365,6 +1382,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.advanced_toggle.setArrowType(QtCore.Qt.RightArrow)
         self.advanced_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
         top_bar.addWidget(self.advanced_toggle)
+
+        self.cf_tuner_btn = QtWidgets.QPushButton("CF Tuner")
+        top_bar.addWidget(self.cf_tuner_btn)
 
         self.atak_btn = QtWidgets.QPushButton("ATAK Bridge")
         top_bar.addWidget(self.atak_btn)
@@ -1753,6 +1773,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn.clicked.connect(self.stop_watchdog)
         self.dark_mode_checkbox.toggled.connect(self.apply_dark_mode)
         self.clear_log_btn.clicked.connect(self.clear_log)
+        self.table.cellDoubleClicked.connect(self._on_detection_row_activated)
+        self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_detection_context_menu)
         self.refresh_devices_btn.clicked.connect(self.refresh_device_list)
         self.device_type_combo.currentIndexChanged.connect(self._on_device_type_changed)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
@@ -1771,6 +1794,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ppm_spin.valueChanged.connect(self.on_ppm_changed)
 
         self.atak_btn.clicked.connect(self.show_atak_bridge)
+
+        self.cf_tuner_btn.clicked.connect(self.show_cf_tuner)
         self.soapy_args_edit.textChanged.connect(self.refresh_band_device_dropdowns)
 
         self.on_auto_bin_toggled(self.auto_bin_checkbox.isChecked())
@@ -1782,6 +1807,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.atak_window.show()
         self.atak_window.raise_()
         self.atak_window.activateWindow()
+
+
+    def show_cf_tuner(self):
+        # Popup window; can be closed and reopened.
+        if CenterFrequencyTunerWindow is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "CF Tuner",
+                "CF tuner module isn't available.\n\n"
+                "Make sure hackrf_watchdog/cf_tuner.py exists and required deps are installed."
+            )
+            return
+        try:
+            if self.cf_tuner_window is None:
+                self.cf_tuner_window = CenterFrequencyTunerWindow(parent=self)
+                # When the dialog finishes, drop the reference so it can be recreated cleanly.
+                self.cf_tuner_window.finished.connect(lambda _=0: setattr(self, "cf_tuner_window", None))
+            self.cf_tuner_window.show()
+            self.cf_tuner_window.raise_()
+            self.cf_tuner_window.activateWindow()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "CF Tuner", f"Failed to open CF tuner window:\n\n{e}")
 
     def _create_timers(self):
         # Detection table refresh (UI). The detection engine can run much faster.
@@ -2551,6 +2598,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_settings(self) -> None:
         s = QtCore.QSettings()
+        # Dark mode default: ON
+        try:
+            dm = s.value("watchdog/dark_mode")
+            if dm is None:
+                dm_val = True
+            elif isinstance(dm, str):
+                dm_val = dm.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                dm_val = bool(dm)
+            self.dark_mode_checkbox.setChecked(dm_val)
+        except Exception:
+            self.dark_mode_checkbox.setChecked(True)
+
         try:
             mode = s.value("watchdog/mode", MODE_SINGLE)
             if mode in (MODE_SINGLE, MODE_PARALLEL):
@@ -2641,6 +2701,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _save_settings(self) -> None:
         try:
             s = QtCore.QSettings()
+            s.setValue("watchdog/dark_mode", bool(self.dark_mode_checkbox.isChecked()))
             s.setValue("watchdog/mode", str(self.mode_combo.currentText()))
             s.setValue("watchdog/device_type", str(self.device_type_combo.currentText()))
             s.setValue("watchdog/perf_preset", str(self.perf_combo.currentText()))
@@ -3100,6 +3161,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._dropped_log_lines = 0
         self.log_edit.clear()
 
+
     def apply_dark_mode(self, enabled: bool):
         if enabled:
             self.setStyleSheet(
@@ -3116,12 +3178,113 @@ class MainWindow(QtWidgets.QMainWindow):
                 """
             )
         else:
-            self.setStyleSheet("")
+            # Force a consistent LIGHT theme even if the desktop environment is in dark mode.
+            self.setStyleSheet(
+                """
+                QWidget { background-color: #f3f3f3; color: #111; }
+                QGroupBox { border: 1px solid #c8c8c8; margin-top: 6px; }
+                QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 3px 0 3px; }
+                QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit, QTableWidget {
+                    background-color: #ffffff; color: #111; border: 1px solid #bdbdbd;
+                }
+                QHeaderView::section { background-color: #e9e9e9; color: #111; border: 1px solid #cfcfcf; }
+                QPushButton { background-color: #e9e9e9; color: #111; border: 1px solid #bdbdbd; padding: 4px 8px; }
+                QPushButton:pressed { background-color: #dcdcdc; }
+                QPushButton:disabled { background-color: #efefef; color: #999; }
+                QCheckBox { color: #111; }
+                """
+            )
 
+
+
+
+    def _get_busy_devices_for_cf_tuner(self):
+        """Return (busy_hackrf_serials, busy_soapy_args) currently used by scanning."""
+        busy_hackrf = set()
+        busy_soapy = set()
+
+        w = getattr(self, "worker", None)
+        if w is not None:
+            try:
+                if isinstance(w, SweepWorker):
+                    serial = str(getattr(w, "device_arg", "") or getattr(w, "source_id", "") or "").strip()
+                    if serial:
+                        busy_hackrf.add(serial)
+                elif isinstance(w, SoapyTimeSliceWorker):
+                    args = str(getattr(w, "soapy_args", "") or "").strip()
+                    if args:
+                        busy_soapy.add(args)
+            except Exception:
+                pass
+
+        for w in getattr(self, "parallel_workers", []) or []:
+            try:
+                if isinstance(w, SweepWorker):
+                    serial = str(getattr(w, "device_arg", "") or getattr(w, "source_id", "") or "").strip()
+                    if serial:
+                        busy_hackrf.add(serial)
+                elif isinstance(w, SoapyTimeSliceWorker):
+                    args = str(getattr(w, "soapy_args", "") or "").strip()
+                    if args:
+                        busy_soapy.add(args)
+            except Exception:
+                pass
+
+        return busy_hackrf, busy_soapy
+
+    def _open_cf_tuner_with_freq(self, freq_hz: int):
+        """Open CF tuner window and preset CF (no auto-start)."""
+        self.show_cf_tuner()
+        try:
+            w = getattr(self, "cf_tuner_window", None)
+            if w is None:
+                return
+            busy_h, busy_s = self._get_busy_devices_for_cf_tuner()
+            if hasattr(w, "set_busy_devices"):
+                w.set_busy_devices(busy_h, busy_s)
+            if hasattr(w, "refresh_devices"):
+                w.refresh_devices()
+            if hasattr(w, "auto_select_free_device"):
+                w.auto_select_free_device()
+            if hasattr(w, "set_frequency_hz"):
+                w.set_frequency_hz(int(freq_hz))
+        except Exception as e:
+            try:
+                QtWidgets.QMessageBox.warning(self, "CF Tuner", "Could not preset CF tuner:\n\n" + str(e))
+            except Exception:
+                pass
+
+    def _on_detection_row_activated(self, row: int, _col: int):
+        """Double-click a detection row to open CF tuner and preset CF."""
+        try:
+            item = self.table.item(row, 0)
+            if item is None:
+                return
+            txt = str(item.text() or "").strip()
+            if not txt:
+                return
+            mhz = float(txt)
+            self._open_cf_tuner_with_freq(int(mhz * 1_000_000))
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "CF Tuner", "Couldn't tune to detection:\n\n" + str(e))
+
+    def _on_detection_context_menu(self, pos):
+        """Right-click menu on detections table."""
+        item = self.table.itemAt(pos)
+        if item is None:
+            return
+        row = item.row()
+
+        menu = QtWidgets.QMenu(self)
+        act_tune = menu.addAction("Tune in CF Tuner")
+        act = menu.exec_(self.table.viewport().mapToGlobal(pos))
+        if act == act_tune:
+            self._on_detection_row_activated(row, 0)
 
 def main():
     try:
         app = QtWidgets.QApplication(sys.argv)
+        app.setStyle("Fusion")
         app.setOrganizationName("HackRF-Watchdog")
         app.setApplicationName("HackRF-Watchdog")
 
