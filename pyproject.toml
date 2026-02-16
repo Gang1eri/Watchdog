@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hackrf-watchdog"
+name = "watchdog"
 version = "0.1.0"
-description = "Hackrf-Watchdog: wideband HackRF sweep monitor with per-band alerts"
+description = "Watchdog: wideband RF sweep monitor with per-band alerts"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -17,4 +17,5 @@ dependencies = [
 ]
 
 [project.scripts]
-hackrf-watchdog-sweep = "hackrf_watchdog.cli:main"
+watchdog-sweep = "hackrf_watchdog.cli:main"
+watchdog-doctor = "hackrf_watchdog.doctor:main"
