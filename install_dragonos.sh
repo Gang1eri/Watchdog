@@ -22,8 +22,10 @@ install_required_candidates() {
   for pkg in "$@"; do
     if apt-cache show "$pkg" >/dev/null 2>&1; then
       echo "[Watchdog] Installing $label: $pkg"
-      sudo apt install -y "$pkg"
-      return 0
+      if sudo apt install -y "$pkg"; then
+        return 0
+      fi
+      echo "[Watchdog] WARNING: install failed for candidate $pkg, trying next..."
     fi
   done
   echo "[Watchdog] ERROR: No installable package found for: $label"
@@ -38,37 +40,74 @@ install_optional_candidates() {
   for pkg in "$@"; do
     if apt-cache show "$pkg" >/dev/null 2>&1; then
       echo "[Watchdog] Installing optional package ($label): $pkg"
-      sudo apt install -y "$pkg"
-      return 0
+      if sudo apt install -y "$pkg"; then
+        return 0
+      fi
+      echo "[Watchdog] WARNING: optional install failed for candidate $pkg, trying next..."
     fi
   done
   echo "[Watchdog] WARNING: Optional package not found for: $label (tried: $*)"
   return 0
 }
 
+soapy_has_factory() {
+  local driver="$1"
+  if ! command -v SoapySDRUtil >/dev/null 2>&1; then
+    return 1
+  fi
+  local factories
+  factories="$(SoapySDRUtil --info 2>/dev/null | sed -n 's/^Available factories[.:\t ]*//p' | head -n1)"
+  if [[ -z "$factories" ]]; then
+    return 1
+  fi
+  echo "$factories" | tr ',' ' ' | tr -s '[:space:]' '\n' | grep -Fxq "$driver"
+}
+
 # Core app/runtime dependencies.
 sudo apt install -y \
   git \
-  hackrf \
   python3 python3-venv python3-pip \
   python3-pyqt5 python3-pyqt5.qtmultimedia \
   python3-pyqtgraph \
   libusb-1.0-0
+
+# HackRF tools:
+# - If already present (common on DragonOS), keep going.
+# - Otherwise try distro package candidates.
+if command -v hackrf_info >/dev/null 2>&1 && command -v hackrf_sweep >/dev/null 2>&1; then
+  echo "[Watchdog] HackRF tools already available on PATH."
+else
+  install_required_candidates "HackRF tools" \
+    hackrf
+fi
 
 # Soapy runtime + discovery utility (required by backend doctor checks).
 install_required_candidates "SoapySDR tools/runtime" \
   soapysdr-tools
 
 # Required Soapy modules for co-equal RTL-SDR + bladeRF backend support.
-install_required_candidates "Soapy RTL-SDR module" \
-  soapysdr-module-rtlsdr \
-  soapysdr-module-rtl-sdr
-install_required_candidates "Soapy bladeRF module" \
-  soapysdr-module-bladerf
+if soapy_has_factory "rtlsdr"; then
+  echo "[Watchdog] Soapy factory 'rtlsdr' already available."
+else
+  install_required_candidates "Soapy RTL-SDR module" \
+    soapysdr-module-rtlsdr \
+    soapysdr-module-rtl-sdr
+fi
+
+if soapy_has_factory "bladerf"; then
+  echo "[Watchdog] Soapy factory 'bladerf' already available."
+else
+  install_required_candidates "Soapy bladeRF module" \
+    soapysdr-module-bladerf
+fi
 
 # Optional module for HackRF stream mode via Soapy backend.
-install_optional_candidates "Soapy HackRF module (stream mode)" \
-  soapysdr-module-hackrf
+if soapy_has_factory "hackrf"; then
+  echo "[Watchdog] Soapy factory 'hackrf' already available."
+else
+  install_optional_candidates "Soapy HackRF module (stream mode)" \
+    soapysdr-module-hackrf
+fi
 
 # Optional vendor utility packages (useful for diagnostics/manual checks).
 install_optional_candidates "RTL-SDR tools" rtl-sdr
