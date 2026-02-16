@@ -51,7 +51,7 @@ def parse_band_option(band_str: str) -> BandConfig:
 )
 def main(start_mhz, stop_mhz, bin_width_hz, bands):
     """
-    Hackrf-Watchdog: wideband HackRF sweep monitor with per-band alerts.
+    Watchdog: wideband RF sweep monitor with per-band alerts.
     """
     if not bands:
         bands = [
@@ -105,3 +105,7 @@ def main(start_mhz, stop_mhz, bin_width_hz, bands):
         detect_on_sweep_stream(det_cfg, alert_cfg, sweep_iter, on_alert)
     except KeyboardInterrupt:
         click.echo("Stopped by user.", err=True)
+
+
+if __name__ == "__main__":
+    main()

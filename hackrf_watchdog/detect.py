@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import Dict, Callable, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import DetectorConfig, BandConfig, AlertConfig
 
@@ -15,6 +15,57 @@ class BandState:
 def band_freq_range(band: BandConfig) -> Tuple[float, float]:
     half = band.width_hz / 2.0
     return band.center_hz - half, band.center_hz + half
+
+
+def _frame_get(frame: Any, key: str, default=None):
+    if isinstance(frame, dict):
+        return frame.get(key, default)
+    return getattr(frame, key, default)
+
+
+def _normalize_frame(frame: Any) -> Optional[Tuple[float, float, List[float]]]:
+    """Accept legacy dict frames and new SweepFrame objects."""
+    powers = _frame_get(frame, "powers_dbm")
+    if powers is None:
+        powers = _frame_get(frame, "powers_db")
+    if powers is None:
+        powers = _frame_get(frame, "powers")
+    if not powers:
+        return None
+
+    low_hz = _frame_get(frame, "low_hz")
+    if low_hz is None:
+        low_hz = _frame_get(frame, "start_hz")
+
+    bin_width = _frame_get(frame, "bin_width_hz")
+    if bin_width is None:
+        bin_width = _frame_get(frame, "bin_width")
+
+    # Some backends only expose center frequencies. Infer low/bin when possible.
+    if low_hz is None or bin_width is None:
+        freqs_hz = _frame_get(frame, "freqs_hz")
+        try:
+            freqs_hz = list(freqs_hz or [])
+            if len(freqs_hz) >= 2:
+                inferred_bin = float(freqs_hz[1]) - float(freqs_hz[0])
+                if bin_width is None:
+                    bin_width = inferred_bin
+                if low_hz is None:
+                    low_hz = float(freqs_hz[0]) - 0.5 * float(bin_width)
+        except Exception:
+            return None
+
+    try:
+        low_hz = float(low_hz)
+        bin_width = float(bin_width)
+        powers = [float(p) for p in powers]
+    except Exception:
+        return None
+
+    if bin_width <= 0:
+        return None
+
+    return low_hz, bin_width, powers
 
 
 def detect_on_sweep_stream(
@@ -36,9 +87,10 @@ def detect_on_sweep_stream(
     }
 
     for frame in sweep_iter:
-        low_hz = frame["low_hz"]
-        bin_width = frame["bin_width_hz"]
-        powers = frame["powers_dbm"]
+        norm = _normalize_frame(frame)
+        if norm is None:
+            continue
+        low_hz, bin_width, powers = norm
 
         for band in cfg.bands:
             state = band_states[band.name]

@@ -39,7 +39,7 @@ class AtakBridgeConfig:
     use_per_frequency_uid: bool = True
     callsign_prefix: str = "RF-"
 
-    static_callsign: str = "HackRF-Watchdog"
+    static_callsign: str = "Watchdog"
     static_uid: str = ""
 
 
@@ -254,7 +254,7 @@ class AtakBridge(QtCore.QObject):
         cot = self._build_cot(
             uid=self.cfg.static_uid,
             callsign=self.cfg.static_callsign,
-            remarks="CoT test from HackRF-Watchdog",
+            remarks="CoT test from Watchdog",
         )
         self._send_raw(cot, emit_success_status=True, success_label="Test sent")
 
@@ -324,7 +324,7 @@ class AtakBridge(QtCore.QObject):
         if band:
             parts.append(f"Band: {band}")
 
-        remarks = " | ".join(parts) if parts else "HackRF-Watchdog detection"
+        remarks = " | ".join(parts) if parts else "Watchdog detection"
         cot = self._build_cot(uid=uid, callsign=callsign, remarks=remarks)
 
         # Do NOT emit success status here (would spam), but we DO emit errors if they happen.
@@ -494,7 +494,7 @@ class AtakBridgeWindow(QtWidgets.QDialog):
     def update_preview(self) -> None:
         use_per_freq = self.per_freq_cb.isChecked()
         prefix = (self.prefix_edit.text().strip() or "RF-")
-        static_callsign = (self.static_callsign_edit.text().strip() or "HackRF-Watchdog")
+        static_callsign = (self.static_callsign_edit.text().strip() or "Watchdog")
         sample = float(self.sample_freq_spin.value())
 
         if use_per_freq and sample > 0:
@@ -537,7 +537,7 @@ class AtakBridgeWindow(QtWidgets.QDialog):
             use_per_frequency_uid=self.per_freq_cb.isChecked(),
             callsign_prefix=self.prefix_edit.text().strip() or "RF-",
 
-            static_callsign=self.static_callsign_edit.text().strip() or "HackRF-Watchdog",
+            static_callsign=self.static_callsign_edit.text().strip() or "Watchdog",
             static_uid=self.static_uid_edit.text().strip(),
         )
 

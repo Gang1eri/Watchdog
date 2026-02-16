@@ -1,7 +1,7 @@
 """
-Hackrf-Watchdog package.
+Watchdog package.
 
-Wideband HackRF sweep monitor with per-band alerts.
+Wideband RF sweep monitor with per-band alerts.
 """
 
 __all__ = []

@@ -1,5 +1,5 @@
 """
-HackRF Watchdog sweep backend.
+Watchdog sweep backend.
 
 - Wraps `hackrf_sweep` and yields sweep frames (frequency/power bins).
 - Supports one-shot sweeps (stable for time-slicing) and continuous streaming (stable for Windows USB).
@@ -47,6 +47,24 @@ def _normalize_hackrf_serial(serial: str) -> str:
     if len(s) > 16:
         s = s[-16:]
     return s
+
+
+def _maybe_prepend_stdbuf(cmd: List[str]) -> List[str]:
+    """Force line-buffering when stdout/stderr are piped.
+
+    When hackrf_sweep stdout is captured (not a TTY), it can switch to block buffering
+    and appear to "do nothing" for a long time (or indefinitely) from the UI's
+    perspective. Wrapping with `stdbuf -oL -eL` forces line-buffering so we get data
+    promptly.
+    """
+
+    # Only relevant on POSIX. On Windows, stdbuf is usually not available.
+    if os.name != "posix":
+        return cmd
+    stdbuf = shutil.which("stdbuf")
+    if not stdbuf:
+        return cmd
+    return [stdbuf, "-oL", "-eL", *cmd]
 
 
 def _split_csv(line: str) -> Optional[List[str]]:
@@ -176,10 +194,15 @@ def iter_sweep_frames(
         env["PATH"] = cwd + os.pathsep + env.get("PATH", "")
 
     # Spawn process
+    # Force line-buffering for hackrf_sweep when we capture its output.
+    cmd = _maybe_prepend_stdbuf(cmd)
+
+    # In continuous mode we merge stderr into stdout so we cannot deadlock on stderr
+    # filling up while we only read stdout.
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=(subprocess.STDOUT if continuous else subprocess.PIPE),
         text=True,
         bufsize=1,
         universal_newlines=True,
@@ -188,11 +211,21 @@ def iter_sweep_frames(
     )
 
     def _die_with_err(prefix: str) -> None:
+        """Try to include whatever output we can in the error."""
         try:
             out, err = proc.communicate(timeout=0.2)
         except Exception:
             out, err = "", ""
-        raise SweepBackendError(f"{prefix}. Exit code: {proc.returncode}, stderr: {err.strip()}")
+
+        # If stderr is merged into stdout, `err` will be empty; include a small stdout tail.
+        tail = ""
+        if (not err) and out:
+            tail = out.strip()[-500:]
+        if err:
+            raise SweepBackendError(f"{prefix}. Exit code: {proc.returncode}, stderr: {err.strip()}")
+        if tail:
+            raise SweepBackendError(f"{prefix}. Exit code: {proc.returncode}, output: {tail}")
+        raise SweepBackendError(f"{prefix}. Exit code: {proc.returncode}")
 
     try:
         if not continuous:
