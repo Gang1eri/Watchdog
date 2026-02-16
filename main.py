@@ -5,11 +5,11 @@ import math
 import subprocess
 import os
 import shutil
-import re
 import ctypes
 import ctypes.util
 import inspect
 from typing import List, Dict, Any, Optional
+from collections import deque
 
 import traceback
 import faulthandler
@@ -55,6 +55,12 @@ from PyQt5.QtMultimedia import QSoundEffect
 
 from hackrf_watchdog.sweep_backend import iter_sweep_frames, SweepBackendError
 from hackrf_watchdog.atak_bridge import AtakBridge, AtakBridgeWindow
+from hackrf_watchdog.device_discovery import (
+    list_hackrf_devices as _discover_hackrf_devices,
+    list_soapy_devices as _discover_soapy_devices,
+    parse_soapy_args as _parse_soapy_args,
+)
+from hackrf_watchdog.doctor import check_hackrf_backend, check_soapy_backend
 
 try:
     from hackrf_watchdog.cf_tuner import CenterFrequencyTunerWindow
@@ -64,8 +70,6 @@ except Exception:
 # ---------------------------------------------------------------------------
 # WATCHDOG MULTI-SDR STEP1 (UI-only, no behavior change by default)
 # ---------------------------------------------------------------------------
-MODE_SINGLE = "Single SDR (current)"
-MODE_PARALLEL = "Parallel SDRs (multi)"
 DEVICE_HACKRF = "HackRF (hackrf_sweep)"
 DEVICE_SOAPY = "SoapySDR (experimental)"
 
@@ -105,33 +109,7 @@ def set_bias_tee(enable: bool, log_fn, serial: Optional[str] = None) -> bool:
 # ---------------------------------------------------------------------------
 
 def list_hackrf_devices() -> List[Dict[str, str]]:
-    devices: List[Dict[str, str]] = []
-    try:
-        result = subprocess.run(
-            ["hackrf_info"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=5,
-        )
-    except Exception:
-        return devices
-
-    index = -1
-    for line in result.stdout.splitlines():
-        raw = line.strip()
-        low = raw.lower()
-
-        if low.startswith("found hackrf"):
-            index += 1
-
-        if "serial" in low and ":" in raw:
-            _, val = raw.split(":", 1)
-            serial = val.strip()
-            if serial:
-                devices.append({"index": str(index), "serial": serial})
-
-    return devices
+    return _discover_hackrf_devices()
 
 
 
@@ -140,88 +118,7 @@ def list_hackrf_devices() -> List[Dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 def list_soapy_devices() -> List[Dict[str, Any]]:
-    """Return discovered SoapySDR devices.
-
-    Windows-friendly: does NOT require Python SoapySDR bindings.
-    Uses SoapySDRUtil (PothosSDR) and parses its output.
-
-    Each item contains:
-      - label: display label
-      - args_str: selector string like 'driver=bladerf,serial=...'
-      - info: parsed key/value dict
-    """
-    util = shutil.which("SoapySDRUtil")
-
-    if util is None and os.name == "nt":
-        roots: List[str] = []
-        env_root = os.environ.get("POTHOS")
-        if env_root:
-            roots.append(env_root)
-        roots.extend([r"C:\Program Files\PothosSDR", r"C:\Program Files (x86)\PothosSDR"])
-        for root in roots:
-            cand = os.path.join(root, "bin", "SoapySDRUtil.exe")
-            if os.path.isfile(cand):
-                util = cand
-                break
-
-    if not util:
-        return []
-
-    try:
-        p = subprocess.run(
-            [util, "--find"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        out = p.stdout or ""
-    except Exception:
-        return []
-
-    # Parse SoapySDRUtil output blocks.
-    blocks: List[Dict[str, str]] = []
-    cur: Optional[Dict[str, str]] = None
-    for raw in out.splitlines():
-        line = raw.rstrip("\r\n")
-        if line.startswith("Found device"):
-            if cur is not None:
-                blocks.append(cur)
-            cur = {}
-            continue
-        if cur is None:
-            continue
-        m = re.match(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.*)\s*$", line)
-        if not m:
-            continue
-        cur[m.group(1).strip()] = m.group(2).strip()
-    if cur is not None:
-        blocks.append(cur)
-
-    devices: List[Dict[str, Any]] = []
-    for info in blocks:
-        driver = str(info.get("driver") or "").strip()
-        if not driver:
-            continue
-        dlow = driver.lower()
-        serial = str(info.get("serial") or "").strip()
-        label = str(info.get("label") or "").strip() or driver
-        # Hide Soapy-provided "hackrf" entries. We always use native HackRF via hackrf_sweep.
-        # Also hide audio devices.
-        label_l = (label or "").lower()
-        if dlow == "audio" or "audio" in dlow:
-            continue
-        if "hackrf" in dlow or "hackrf" in label_l:
-            continue
-
-        args = f"driver={driver}"
-        if serial:
-            args += f",serial={serial}"
-
-        devices.append({"label": label, "args_str": args, "info": info})
-
-    return devices
+    return _discover_soapy_devices()
 
 # ---------------------------------------------------------------------------
 # SoapySDR C-API wrapper (ctypes)
@@ -330,6 +227,11 @@ class _SoapyCAPI:
         self._setGain.restype = c_int
         self._setGain.argtypes = [c_void_p, c_int, c_size_t, c_double]
 
+        # Generic device settings (e.g., biastee/bias_tx per driver)
+        self._writeSetting = lib.SoapySDRDevice_writeSetting
+        self._writeSetting.restype = None
+        self._writeSetting.argtypes = [c_void_p, c_char_p, c_char_p]
+
         # Stream API
         self._setupStream = lib.SoapySDRDevice_setupStream
         self._setupStream.restype = c_void_p
@@ -379,10 +281,14 @@ class _SoapyCAPI:
             self._unmake(dev)
 
     def set_sample_rate(self, dev, direction: int, chan: int, rate_hz: float):
-        self._setSampleRate(dev, int(direction), ctypes.c_size_t(chan), float(rate_hz))
+        ret = self._setSampleRate(dev, int(direction), ctypes.c_size_t(chan), float(rate_hz))
+        if int(ret) != 0:
+            raise RuntimeError(f"SoapySDR setSampleRate failed (Fs={float(rate_hz)/1e6:.3f} MHz). {self.last_error()}")
 
     def set_bandwidth(self, dev, direction: int, chan: int, bw_hz: float):
-        self._setBandwidth(dev, int(direction), ctypes.c_size_t(chan), float(bw_hz))
+        ret = self._setBandwidth(dev, int(direction), ctypes.c_size_t(chan), float(bw_hz))
+        if int(ret) != 0:
+            raise RuntimeError(f"SoapySDR setBandwidth failed (BW={float(bw_hz)/1e6:.3f} MHz). {self.last_error()}")
 
     def set_frequency(self, dev, direction: int, chan: int, freq_hz: float):
         # args = NULL
@@ -390,6 +296,13 @@ class _SoapyCAPI:
 
     def set_gain(self, dev, direction: int, chan: int, gain_db: float):
         self._setGain(dev, int(direction), ctypes.c_size_t(chan), float(gain_db))
+
+    def write_setting(self, dev, key: str, value: str):
+        self._writeSetting(
+            dev,
+            str(key).encode("utf-8", errors="ignore"),
+            str(value).encode("utf-8", errors="ignore"),
+        )
 
     def setup_stream_cf32(self, dev, direction: int, chan: int):
         chans = (ctypes.c_size_t * 1)(ctypes.c_size_t(chan))
@@ -487,7 +400,11 @@ class SweepWorker(QtCore.QObject):
         except Exception:
             self._supports_continuous = False
         self._noise_floor = None
+        self._noise_mad = None
+        self._noise_mad = None
         self._hold_state: Dict[float, Dict[str, Any]] = {}
+        self._hit_times: Dict[float, deque] = {}  # for persistence (hits within a window)
+        #dow)
         # Throttle 'Max:' log lines to keep UI responsive (engine may run very fast)
         self._last_max_log_t = 0.0
         self.max_log_period_s = 0.25
@@ -741,19 +658,34 @@ class SweepWorker(QtCore.QObject):
         else:
             noise_candidates = sorted_p
         median_noise = statistics.median(noise_candidates)
+        # Robust spread estimate: MAD (median absolute deviation)
+        try:
+            mad = statistics.median([abs(p - median_noise) for p in noise_candidates]) + 1e-9
+        except Exception:
+            mad = 1.0
 
         if self._noise_floor is None:
             self._noise_floor = median_noise
+            self._noise_mad = mad
         else:
             alpha = 0.1
             self._noise_floor = (1 - alpha) * self._noise_floor + alpha * median_noise
+            self._noise_mad = (1 - alpha) * float(getattr(self, "_noise_mad", mad)) + alpha * mad
 
         self.noise_floor_updated.emit(self._noise_floor)
 
-        if self.use_local_noise_floor:
-            abs_threshold = self._noise_floor + float(self.threshold_db)
+        thr_db = float(band.get('threshold_db', self.threshold_db))
+
+        use_nf = bool(band.get('use_noise_floor', self.use_local_noise_floor))
+        only_above = bool(band.get('only_show_above', self.only_above_threshold))
+        hold = float(band.get('hold_time_s', self.min_hold_time_s))
+
+        if use_nf:
+            # Robust threshold: median + k*MAD (k comes from Threshold control)
+            mad = float(getattr(self, "_noise_mad", 1.0))
+            abs_threshold = float(self._noise_floor) + (thr_db * mad)
         else:
-            abs_threshold = float(self.threshold_db)
+            abs_threshold = thr_db
 
         # Prefer explicit low/bin info (hackrf_sweep legacy), otherwise fall back
         # to SweepFrame-style attributes.
@@ -823,8 +755,18 @@ class SweepWorker(QtCore.QObject):
                     st["above"] = True
 
                 dwell = 0.0 if st["first_seen"] is None else now - st["first_seen"]
-
                 if hold <= 0 or dwell >= hold:
+                    # Persistence filter: require at least 2 hits within a short window.
+                    ht = self._hit_times.get(key)
+                    if ht is None:
+                        ht = deque()
+                        self._hit_times[key] = ht
+                    ht.append(now)
+                    # keep only last 0.6s
+                    while ht and (now - ht[0]) > 0.6:
+                        ht.popleft()
+                    if len(ht) < 2:
+                        continue
                     detections.append(
                         {
                             "freq_mhz": freq_mhz,
@@ -866,7 +808,7 @@ class SweepWorker(QtCore.QObject):
             now_t = time.time()
             if (now_t - getattr(self, "_last_max_log_t", 0.0)) >= float(getattr(self, "max_log_period_s", 0.25)):
                 self._last_max_log_t = now_t
-                if self.only_above_threshold:
+                if only_above:
                     if max_power >= abs_threshold:
                         self.log_message.emit(line)
                 else:
@@ -880,7 +822,6 @@ class SweepWorker(QtCore.QObject):
 # ---------------------------------------------------------------------------
 # SoapySDR time-slice worker (bladeRF via SoapySDR)
 # ---------------------------------------------------------------------------
-
 class SoapyTimeSliceWorker(QtCore.QObject):
     """Time-slices one SDR across multiple bands (retune -> dwell -> FFT -> bins -> detections).
 
@@ -915,6 +856,7 @@ class SoapyTimeSliceWorker(QtCore.QObject):
         cal_gain_db: float = 0.0,
         cal_loss_db: float = 0.0,
         freq_ppm: float = 0.0,
+        antenna_power: bool = False,
         source_id: str = "Soapy",
         parent=None,
     ):
@@ -928,6 +870,8 @@ class SoapyTimeSliceWorker(QtCore.QObject):
         self.interval_ms = int(interval_ms)
 
         self.soapy_args = str(soapy_args or "driver=bladerf")
+        self._soapy_kv = _parse_soapy_args(self.soapy_args) or {"driver": "bladerf"}
+        self._soapy_driver = str(self._soapy_kv.get("driver") or "unknown")
         self.sample_rate_hz = float(sample_rate_hz)
         self.bandwidth_hz = float(bandwidth_hz)
         self.gain_db = float(gain_db)
@@ -939,11 +883,13 @@ class SoapyTimeSliceWorker(QtCore.QObject):
         self.cal_gain_db = float(cal_gain_db)
         self.cal_loss_db = float(cal_loss_db)
         self.freq_ppm = float(freq_ppm)
+        self.antenna_power = bool(antenna_power)
         self.source_id = str(source_id)
 
         self._running = True
         self._noise_floor = None
         self._hold_state: Dict[float, Dict[str, Any]] = {}
+        self._hit_times: Dict[float, deque] = {}  # for persistence (hits within a window)
 
         self._np = None
         self._SOAPY_SDR_RX = None
@@ -961,17 +907,39 @@ class SoapyTimeSliceWorker(QtCore.QObject):
         return 1.0 + (float(self.freq_ppm) / 1e6)
 
     def _parse_soapy_args(self, s: str) -> Dict[str, str]:
-        out: Dict[str, str] = {}
-        for part in (s or "").split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "=" in part:
-                k, v = part.split("=", 1)
-                out[k.strip()] = v.strip()
+        out = _parse_soapy_args(s)
         if not out:
             out = {"driver": "bladerf"}
         return out
+
+    def _bias_setting_key(self) -> str:
+        drv = str(self._soapy_driver or "").strip().lower()
+        if "rtl" in drv:
+            return "biastee"
+        if "bladerf" in drv or "blade" in drv:
+            return "biastee_rx"
+        if "hackrf" in drv:
+            return "bias_tx"
+        return ""
+
+    def _apply_bias_power(self, enabled: bool, *, quiet: bool = False) -> None:
+        key = self._bias_setting_key()
+        if not key:
+            return
+        val = "true" if bool(enabled) else "false"
+        try:
+            self._soapy.write_setting(self._dev, key, val)
+            if not quiet:
+                self.log_message.emit(
+                    f"SoapySDR Bias-T {'ON' if enabled else 'OFF'} "
+                    f"(driver={self._soapy_driver}, setting={key})"
+                )
+        except Exception as e:
+            if not quiet:
+                self.log_message.emit(
+                    f"SoapySDR Bias-T control failed "
+                    f"(driver={self._soapy_driver}, setting={key}): {e}"
+                )
 
     def _ensure_device(self) -> None:
         if self._dev is not None:
@@ -986,8 +954,10 @@ class SoapyTimeSliceWorker(QtCore.QObject):
 
         if not soapy_capi_available():
             raise RuntimeError(
-                "SoapySDR runtime not available. Install PothosSDR (recommended on Windows) "
-                "and ensure SoapySDR.dll is on PATH (PothosSDR\\bin)."
+                "SoapySDR runtime not available (ctypes C-API load failed).\n"
+                "Linux: install libsoapysdr0.8 + soapysdr-tools (+ soapysdr module for your SDR, e.g. soapysdr-module-bladerf).\n"
+                "Windows: install PothosSDR and ensure SoapySDR.dll is on PATH (PothosSDR\\bin).\n"
+                f"Requested Soapy target: driver={self._soapy_driver}, args='{self.soapy_args}'"
             )
 
         self._soapy = get_soapy_capi()
@@ -996,9 +966,64 @@ class SoapyTimeSliceWorker(QtCore.QObject):
         # Open device from argument string like: 'driver=bladerf,serial=...'
         self._dev = self._soapy.make(self.soapy_args)
 
-        # Configure
-        self._soapy.set_sample_rate(self._dev, self._SOAPY_SDR_RX, self._chan, self.sample_rate_hz)
-        self._soapy.set_bandwidth(self._dev, self._SOAPY_SDR_RX, self._chan, self.bandwidth_hz)
+        # Apply per-device Bias-T before streaming starts.
+        self._apply_bias_power(self.antenna_power, quiet=False)
+
+        # --- Normalize/guard sample-rate & bandwidth before touching the device ---
+        args_l = self.soapy_args.lower()
+        sr = max(1e6, float(self.sample_rate_hz))
+        bw = max(1e6, float(self.bandwidth_hz))
+        if bw > sr:
+            bw = sr
+
+        # Known-safe caps (prevents common "invalid sample rate" errors).
+        # If the runtime/driver supports more, the user can still request it later once we add capability probing.
+        if "driver=bladerf" in args_l or "bladerf" in args_l:
+            sr = min(sr, 61.44e6)
+            bw = min(bw, sr)
+
+        self.sample_rate_hz = sr
+        self.bandwidth_hz = bw
+
+        # Configure (retry with saner rates if driver rejects the requested one)
+        tried_sr = []
+        try:
+            self._soapy.set_sample_rate(self._dev, self._SOAPY_SDR_RX, self._chan, self.sample_rate_hz)
+        except Exception as e:
+            # Try a small list of common SDR rates, descending from requested -> safe.
+            common = [61.44e6, 56e6, 40e6, 30e6, 20e6, 10e6, 5e6, 2e6, 1e6]
+            # Ensure we start at or below the requested sr.
+            common = [r for r in common if r <= float(self.sample_rate_hz) + 1] + [1e6]
+            common = list(dict.fromkeys(common))  # unique, keep order
+            ok = False
+            for r in common:
+                tried_sr.append(r)
+                try:
+                    self._soapy.set_sample_rate(self._dev, self._SOAPY_SDR_RX, self._chan, r)
+                    self.sample_rate_hz = float(r)
+                    # BW must never exceed SR
+                    if self.bandwidth_hz > self.sample_rate_hz:
+                        self.bandwidth_hz = float(self.sample_rate_hz)
+                    ok = True
+                    self.log_message.emit(
+                        f"SoapySDR: requested Fs rejected; using Fs={self.sample_rate_hz/1e6:.1f} MHz instead."
+                    )
+                    break
+                except Exception:
+                    continue
+            if not ok:
+                raise RuntimeError(
+                    f"SoapySDR could not set a valid sample rate. Requested Fs={sr/1e6:.1f} MHz. "
+                    f"Tried: {[round(x/1e6,2) for x in tried_sr]}. Last error: {e}"
+                )
+
+        # Bandwidth (retry by clamping down to <= SR if needed)
+        try:
+            self._soapy.set_bandwidth(self._dev, self._SOAPY_SDR_RX, self._chan, self.bandwidth_hz)
+        except Exception:
+            self.bandwidth_hz = float(min(self.bandwidth_hz, self.sample_rate_hz))
+            self._soapy.set_bandwidth(self._dev, self._SOAPY_SDR_RX, self._chan, self.bandwidth_hz)
+
         try:
             self._soapy.set_gain(self._dev, self._SOAPY_SDR_RX, self._chan, self.gain_db)
         except Exception:
@@ -1023,6 +1048,12 @@ class SoapyTimeSliceWorker(QtCore.QObject):
                     soapy.close_stream(self._dev, self._rx_stream)
                 except Exception:
                     pass
+            # Best-effort safety: disable Bias-T when this worker closes.
+            try:
+                if soapy is not None and self._dev is not None and bool(self.antenna_power):
+                    self._apply_bias_power(False, quiet=True)
+            except Exception:
+                pass
         finally:
             try:
                 if soapy is not None and self._dev is not None:
@@ -1036,9 +1067,11 @@ class SoapyTimeSliceWorker(QtCore.QObject):
         tune_hz = float(center_hz) / f_factor
         # args=NULL in C API
         self._soapy.set_frequency(self._dev, self._SOAPY_SDR_RX, self._chan, tune_hz)
+
     def _read_block(self, nsamps: int):
+        """Read exactly nsamps complex64 samples from the active SoapyRX stream."""
         np = self._np
-        buff = np.empty(nsamps, np.complex64)
+        buff = np.empty(int(nsamps), np.complex64)
         got = 0
         timeout_us = max(50000, int(self.dwell_ms * 1000))
 
@@ -1052,17 +1085,66 @@ class SoapyTimeSliceWorker(QtCore.QObject):
                 continue
             if ret == 0:
                 continue
-            # Negative is an error (timeouts are typically negative too); keep going unless it persists.
-            # We'll just break and zero-fill remaining.
             break
 
         if got < nsamps:
             buff[got:] = 0
-
         return buff
-    def _psd_db(self, x):
+
+    @staticmethod
+    def _next_pow2(n: int) -> int:
+        n = int(max(1, n))
+        return 1 << (n - 1).bit_length()
+
+    @staticmethod
+    def _nearest_pow2_le(n: int, max_pow2: int = 256) -> int:
+        n = int(max(1, n))
+        p = 1 << (n.bit_length() - 1)
+        return int(min(p, max_pow2))
+
+    def _read_block_overlap_decim(self, fft_n: int, decim: int):
         np = self._np
-        n = int(self.fft_size)
+        fft_n = int(fft_n)
+        decim = int(max(1, decim))
+
+        raw_n = fft_n * decim
+        raw_hop = (fft_n // 2) * decim
+        if raw_hop <= 0:
+            raw_hop = max(1, raw_n // 2)
+
+        if getattr(self, "_overlap_tail_raw", None) is None or len(getattr(self, "_overlap_tail_raw")) != raw_hop:
+            self._overlap_tail_raw = None
+
+        if self._overlap_tail_raw is None:
+            raw = self._read_block(raw_n)
+        else:
+            new = self._read_block(raw_hop)
+            raw = np.concatenate((self._overlap_tail_raw, new), axis=0)
+
+        self._overlap_tail_raw = raw[-raw_hop:].copy()
+
+        if decim > 1:
+            if decim & (decim - 1) != 0:
+                decim = 1
+            else:
+                x = raw
+                d = decim
+                while d > 1:
+                    x = 0.5 * (x[0::2] + x[1::2])
+                    d //= 2
+                raw = x
+
+        if len(raw) < fft_n:
+            y = np.zeros(fft_n, np.complex64)
+            y[-len(raw):] = raw
+            raw = y
+        elif len(raw) > fft_n:
+            raw = raw[-fft_n:]
+        return raw
+
+    def _psd_db(self, x, fft_n: Optional[int] = None):
+        np = self._np
+        n = int(fft_n) if fft_n is not None else int(self.fft_size)
         if len(x) < n:
             xx = np.zeros(n, np.complex64)
             xx[-len(x):] = x
@@ -1075,10 +1157,11 @@ class SoapyTimeSliceWorker(QtCore.QObject):
         p = (np.abs(X) ** 2) / (np.sum(window ** 2) + 1e-12)
         return 10.0 * np.log10(p + 1e-12)
 
-    def _fft_freq_axis(self, center_hz: float):
+    def _fft_freq_axis(self, center_hz: float, fft_n: Optional[int] = None, fs_hz: Optional[float] = None):
         np = self._np
-        n = int(self.fft_size)
-        freqs = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / float(self.sample_rate_hz)))
+        n = int(fft_n) if fft_n is not None else int(self.fft_size)
+        fs = float(fs_hz) if fs_hz is not None else float(self.sample_rate_hz)
+        freqs = np.fft.fftshift(np.fft.fftfreq(n, d=1.0 / fs))
         return center_hz + freqs
 
     def _bin_psd_to_band(self, band: Dict[str, Any], freqs_hz, psd_db):
@@ -1122,19 +1205,31 @@ class SoapyTimeSliceWorker(QtCore.QObject):
         else:
             noise_candidates = sorted_p
         median_noise = statistics.median(noise_candidates)
+        try:
+            mad = statistics.median([abs(p - median_noise) for p in noise_candidates]) + 1e-9
+        except Exception:
+            mad = 1.0
 
         if self._noise_floor is None:
             self._noise_floor = median_noise
+            self._noise_mad = mad
         else:
             alpha = 0.1
             self._noise_floor = (1 - alpha) * self._noise_floor + alpha * median_noise
+            self._noise_mad = (1 - alpha) * float(getattr(self, "_noise_mad", mad)) + alpha * mad
 
         self.noise_floor_updated.emit(self._noise_floor)
 
-        if self.use_local_noise_floor:
-            abs_threshold = self._noise_floor + float(self.threshold_db)
+        thr_db = float(band.get('threshold_db', self.threshold_db))
+        use_nf = bool(band.get('use_noise_floor', self.use_local_noise_floor))
+        only_above = bool(band.get('only_show_above', self.only_above_threshold))
+        hold = float(band.get('hold_time_s', self.min_hold_time_s))
+
+        if use_nf:
+            mad = float(getattr(self, "_noise_mad", 1.0))
+            abs_threshold = float(self._noise_floor) + (thr_db * mad)
         else:
-            abs_threshold = float(self.threshold_db)
+            abs_threshold = thr_db
 
         low_hz = float(frame["low_hz"])
         bin_w = float(frame["bin_width_hz"])
@@ -1145,25 +1240,19 @@ class SoapyTimeSliceWorker(QtCore.QObject):
         max_freq_mhz = None
 
         now = time.time()
-        hold = float(self.min_hold_time_s)
-
         band_start_hz = float(band.get("start_hz", float("-inf")))
         band_stop_hz = float(band.get("stop_hz", float("inf")))
 
         for idx in range(len(powers)):
             p_cal = powers[idx]
             p_raw = float(powers_raw[idx])
-
             center_hz_raw = low_hz + (idx + 0.5) * bin_w
-            # Guard: some sweep backends may yield bins slightly outside the requested range.
-            # Only consider bins that fall within the band limits.
             if center_hz_raw < band_start_hz or center_hz_raw > band_stop_hz:
                 continue
-            center_hz = center_hz_raw * f_factor
 
+            center_hz = center_hz_raw * f_factor
             freq_mhz_raw = center_hz_raw / 1e6
             freq_mhz = center_hz / 1e6
-
             key = round(freq_mhz, 6)
             st = self._hold_state.get(key)
 
@@ -1176,8 +1265,16 @@ class SoapyTimeSliceWorker(QtCore.QObject):
                     st["above"] = True
 
                 dwell = 0.0 if st["first_seen"] is None else now - st["first_seen"]
-
                 if hold <= 0 or dwell >= hold:
+                    ht = self._hit_times.get(key)
+                    if ht is None:
+                        ht = deque()
+                        self._hit_times[key] = ht
+                    ht.append(now)
+                    while ht and (now - ht[0]) > 0.6:
+                        ht.popleft()
+                    if len(ht) < 2:
+                        continue
                     detections.append(
                         {
                             "freq_mhz": freq_mhz,
@@ -1213,7 +1310,7 @@ class SoapyTimeSliceWorker(QtCore.QObject):
         span_txt = f"{band['start_mhz']:.3f}-{band['stop_mhz']:.3f} MHz"
         if max_power is not None and max_freq_mhz is not None:
             line = f"Max: {max_power:.1f} dB at {max_freq_mhz:.6f} MHz (span {span_txt})"
-            if self.only_above_threshold:
+            if only_above:
                 if max_power >= abs_threshold:
                     self.log_message.emit(line)
             else:
@@ -1246,31 +1343,52 @@ class SoapyTimeSliceWorker(QtCore.QObject):
                         if self.settle_ms > 0:
                             time.sleep(float(self.settle_ms) / 1000.0)
 
+                        self._overlap_tail_raw = None
+                        span_hz = max(1.0, float(stop_hz - start_hz))
+                        dev_fs = float(self.sample_rate_hz)
+                        target_fs = max(span_hz * 1.10, float(self.bin_width_hz) * 8.0)
+                        target_fs = min(dev_fs, target_fs)
+
+                        ratio = dev_fs / max(1.0, target_fs)
+                        decim = self._nearest_pow2_le(int(ratio), max_pow2=256) if ratio >= 2.0 else 1
+                        eff_fs = dev_fs / float(decim)
+
+                        est_n = int(max(256, min(131072, eff_fs / max(1.0, float(self.bin_width_hz)))))
+                        fft_n = self._next_pow2(est_n)
+
+                        try:
+                            user_n = int(self.fft_size)
+                            if user_n > 0:
+                                fft_n = user_n
+                        except Exception:
+                            pass
+
                         psd_acc = None
                         n_avg = max(1, int(self.avg_frames))
                         for _i in range(n_avg):
                             if not self._running:
                                 break
-                            x = self._read_block(int(self.fft_size))
+                            x = self._read_block_overlap_decim(fft_n, decim)
                             if len(x) < 8:
                                 continue
-                            psd = self._psd_db(x)
+                            psd = self._psd_db(x, fft_n=fft_n)
                             psd_acc = psd if psd_acc is None else (psd_acc + psd)
 
                         if psd_acc is None:
                             continue
 
                         psd_mean = psd_acc / float(n_avg)
-                        freqs = self._fft_freq_axis(center_hz)
+                        freqs = self._fft_freq_axis(center_hz, fft_n=fft_n, fs_hz=eff_fs)
                         frame = self._bin_psd_to_band(band, freqs, psd_mean)
                         if frame is not None:
                             self._handle_frame(band, frame)
 
                         if self.dwell_ms > 0:
                             time.sleep(min(0.05, float(self.dwell_ms) / 1000.0))
-
                     except Exception as e:
-                        self.log_message.emit(f"SoapySDR error: {e}")
+                        self.log_message.emit(
+                            f"SoapySDR error (driver={self._soapy_driver}, args='{self.soapy_args}'): {e}"
+                        )
                         time.sleep(1.0)
 
                 if not self._running:
@@ -1299,26 +1417,17 @@ class SoapyTimeSliceWorker(QtCore.QObject):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("HackRF Watchdog")
+        self.setWindowTitle("Watchdog")
 
-        # ATAK bridge window
+        # ATAK bridge (runs in background). Window is opened on demand via the top-bar button.
         self.atak_bridge = AtakBridge(self)
-        self.atak_window = AtakBridgeWindow(self.atak_bridge, parent=self)
-        self.atak_window.show()
+        self.atak_window = None
         self.atak_bridge.status_changed.connect(lambda s: self.append_log(f"ATAK: {s}"))
 
         # Center Frequency (CF) tuner window (popup)
         self.cf_tuner_window = None
 
-        self.worker_thread: Optional[QtCore.QThread] = None
-        self.worker: Optional[SweepWorker] = None
-
         # Parallel mode (multi HackRF) state
-        self.parallel_threads: List[QtCore.QThread] = []
-        self.parallel_workers: List[SweepWorker] = []
-        self.parallel_serials: List[Optional[str]] = []
-        self._parallel_active = False
-        self._parallel_finished = 0
         self._noise_by_source: Dict[str, float] = {}
 
         self.detections: Dict[float, Dict[str, Any]] = {}
@@ -1333,6 +1442,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._create_timers()
         self.refresh_device_list()
+        self._parallel_update_ui()
+
         self._apply_band_assignment_enabled()
         self._load_settings()
 
@@ -1354,26 +1465,13 @@ class MainWindow(QtWidgets.QMainWindow):
         top_bar.addWidget(self.status_label)
         top_bar.addStretch(1)
 
-        # Mode (single SDR vs multi SDR)
-        top_bar.addWidget(QtWidgets.QLabel("Mode:"))
-        self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems([MODE_SINGLE, MODE_PARALLEL])
-        self.mode_combo.setToolTip(
-            "Single SDR: current behavior (time-slice bands).\n"
-            "Parallel SDRs: future multi-device support (HackRF first)."
-        )
-        top_bar.addWidget(self.mode_combo)
-
-        top_bar.addWidget(QtWidgets.QLabel("Perf:"))
-        self.perf_combo = QtWidgets.QComboBox()
+        # Performance preset UI removed (per-band device settings are authoritative).
+        # Keep the combo alive (hidden) for backward references / config migration.
+        self.perf_combo = QtWidgets.QComboBox(self)
         self.perf_combo.addItems(list(PERF_PRESETS))
-        self.perf_combo.setToolTip(
-            "Controls UI/log throttling for responsiveness vs CPU.\\n"
-            "Max: fastest tripwire. CPU-Lite: best for Raspberry Pi/DragonOS.\\n"
-            "Custom: set by editing Advanced performance values."
-        )
         self.perf_combo.setCurrentText(PERF_BALANCED)
-        top_bar.addWidget(self.perf_combo)
+        self.perf_combo.hide()
+
 
         self.advanced_toggle = QtWidgets.QToolButton()
         self.advanced_toggle.setText("Advanced")
@@ -1443,6 +1541,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---------------- Detection settings group (LEFT) ----------------
         det_group = QtWidgets.QGroupBox("Detection settings")
+        det_group.setVisible(False)  # UI simplified
         det_layout = QtWidgets.QGridLayout(det_group)
 
         row = 0
@@ -1532,6 +1631,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---------------- Device group (RIGHT) ----------------
         device_group = QtWidgets.QGroupBox("Device")
+
+        # IMPORTANT: The legacy top-right "Device" box is now hidden/removed from
+        # the visible layout, but some existing code paths (notably
+        # refresh_device_list during __init__) still reference widgets that live
+        # inside it (e.g. self.device_type_combo). If we don't parent/retain the
+        # group, Qt will destroy it at the end of _build_ui (since it isn't added
+        # to a layout), and those references become "wrapped C/C++ object has been
+        # deleted" at runtime.
+        device_group.setParent(self)
+        self._legacy_device_group = device_group
         dev_layout = QtWidgets.QGridLayout(device_group)
 
         dev_layout.addWidget(QtWidgets.QLabel("Type:"), 0, 0)
@@ -1544,13 +1653,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.device_combo = QtWidgets.QComboBox()
         dev_layout.addWidget(self.device_combo, 1, 1, 1, 2)
 
-
-        # SoapySDR (experimental) settings (hidden unless selected)
-        self.soapy_args_label = QtWidgets.QLabel("Soapy args:")
-        self.soapy_args_edit = QtWidgets.QLineEdit("driver=bladerf")
-        self.soapy_args_edit.setToolTip("Example: driver=bladerf  (later: add serial=..., etc.)")
-        dev_layout.addWidget(self.soapy_args_label, 4, 0)
-        dev_layout.addWidget(self.soapy_args_edit, 4, 1, 1, 2)
 
         # SoapySDR time-slice tuning (shown in Soapy mode and/or Parallel mode)
         self.soapy_rate_label = QtWidgets.QLabel("Sample rate (MHz):")
@@ -1615,9 +1717,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         dev_layout.addWidget(self.soapy_avg_label, 8, 0)
         dev_layout.addWidget(self.soapy_avg_spin, 8, 1)
-
-        self.soapy_args_label.hide()
-        self.soapy_args_edit.hide()
         self.soapy_rate_label.hide()
         self.soapy_rate_spin.hide()
         self.soapy_bw_label.hide()
@@ -1642,108 +1741,718 @@ class MainWindow(QtWidgets.QMainWindow):
         # Make the Device box a bit narrower so it doesn't steal width
         device_group.setMaximumWidth(420)
 
-        # ---------------- Top row layout: Detection (left) + Device (right) ----------------
+        # ---------------- Top row layout: Detection (left) ----------------
+        # The old top-right Device/Soapy box is superseded by per-band cards.
+        # We keep it instantiated (to avoid breaking any references) but do not display it.
+        device_group.setVisible(False)
+        device_group.setMaximumWidth(0)
+
         top_row = QtWidgets.QHBoxLayout()
         det_group.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-        device_group.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Preferred)
-
         top_row.addWidget(det_group, 1)
-        top_row.addWidget(device_group, 0)
-
         main_layout.addLayout(top_row)
 
         # ---------------- Band configuration group ----------------
+        # Collapsible per-band "cards" (always-visible header: enable + span + device + start/stop,
+        # expandable body: start/stop edits + placeholder for future per-band settings).
+
         band_group = QtWidgets.QGroupBox("Band configurations")
-        bg_layout = QtWidgets.QGridLayout(band_group)
+        bg_v = QtWidgets.QVBoxLayout(band_group)
+        bg_v.setContentsMargins(8, 8, 8, 8)
+        bg_v.setSpacing(6)
 
-        row = 0
-        bg_layout.addWidget(QtWidgets.QLabel("Band"), row, 0)
-        bg_layout.addWidget(QtWidgets.QLabel("Enabled"), row, 1)
-        bg_layout.addWidget(QtWidgets.QLabel("Start (MHz)"), row, 2)
-        bg_layout.addWidget(QtWidgets.QLabel("Stop (MHz)"), row, 3)
-        bg_layout.addWidget(QtWidgets.QLabel("Device"), row, 4)
+        # Visible top-row controls for the band cards
+        band_top = QtWidgets.QWidget()
+        band_top_l = QtWidgets.QHBoxLayout(band_top)
+        band_top_l.setContentsMargins(0, 0, 0, 0)
+        band_top_l.setSpacing(8)
 
-        row += 1
-        self.bandA_label = QtWidgets.QLabel("Band A")
-        self.bandA_enable = QtWidgets.QCheckBox()
+        self.refresh_devices_btn_top = QtWidgets.QPushButton("Refresh devices")
+        self.refresh_devices_btn_top.setToolTip("Re-scan connected SDRs (HackRF + SoapySDR)")
+        band_top_l.addStretch(1)
+        band_top_l.addWidget(self.refresh_devices_btn_top)
+
+        bg_v.addWidget(band_top)
+
+        # Helper to build one band card
+        def _build_band_card(letter: str, enable_cb, start_edit, stop_edit, device_combo, start_btn, stop_btn):
+            card = QtWidgets.QFrame()
+            card.setFrameShape(QtWidgets.QFrame.NoFrame)
+            card_v = QtWidgets.QVBoxLayout(card)
+            card_v.setContentsMargins(0, 0, 0, 0)
+            card_v.setSpacing(2)
+
+            # Header row
+            hdr = QtWidgets.QWidget()
+            hdr_l = QtWidgets.QHBoxLayout(hdr)
+            hdr_l.setContentsMargins(0, 0, 0, 0)
+            hdr_l.setSpacing(8)
+
+            exp_btn = QtWidgets.QToolButton()
+            exp_btn.setCheckable(True)
+            exp_btn.setChecked(False)
+            exp_btn.setArrowType(QtCore.Qt.RightArrow)
+            exp_btn.setToolButtonStyle(QtCore.Qt.ToolButtonIconOnly)
+            exp_btn.setAutoRaise(True)
+            exp_btn.setFixedWidth(18)
+            # Keep the tiny band expander readable even when global QToolButton
+            # styles add padding for larger buttons.
+            exp_btn.setStyleSheet(
+                """
+                QToolButton { padding: 0px; border: 1px solid transparent; min-width: 18px; max-width: 18px; }
+                QToolButton:hover { border: 1px solid #666; }
+                QToolButton:pressed { padding-top: 1px; padding-bottom: 0px; }
+                """
+            )
+
+            # Always-visible span label
+            span_lbl = QtWidgets.QLabel("Span: ---.---–---.--- MHz")
+            span_lbl.setStyleSheet("color: #bfbfbf;")
+
+            status_lbl = QtWidgets.QLabel("Idle")
+            status_lbl.setStyleSheet("color: #9a9a9a;")
+
+            # Move the device combo + start/stop buttons into the header (always visible)
+            dev_lbl = QtWidgets.QLabel("Device:")
+
+            hdr_l.addWidget(exp_btn)
+            hdr_l.addWidget(enable_cb)
+            hdr_l.addSpacing(8)
+            hdr_l.addWidget(span_lbl, 1)
+            hdr_l.addWidget(status_lbl)
+
+            # Quick span presets
+            preset_combo = QtWidgets.QComboBox()
+            preset_combo.setMaximumWidth(210)
+            preset_combo.addItem("Preset…", None)
+            preset_combo.addItem("Ham 2m (144–148)", (144.0, 148.0))
+            preset_combo.addItem("Ham 70cm (420–450)", (420.0, 450.0))
+            preset_combo.addItem("ISM 902–928", (902.0, 928.0))
+            preset_combo.addItem("FRS/GMRS (462–467)", (462.0, 467.0))
+            preset_combo.addItem("2.4 GHz Wi‑Fi (2400–2483.5)", (2400.0, 2483.5))
+            preset_combo.addItem("5.8 GHz ISM (5725–5875)", (5725.0, 5875.0))
+
+            def _apply_preset(_i: int):
+                try:
+                    v = preset_combo.currentData()
+                    if v and isinstance(v, tuple) and len(v) == 2:
+                        a, b = float(v[0]), float(v[1])
+                        start_edit.blockSignals(True); stop_edit.blockSignals(True)
+                        start_edit.setValue(a); stop_edit.setValue(b)
+                        start_edit.blockSignals(False); stop_edit.blockSignals(False)
+                        _update_span()
+                        # enforce device clamps immediately
+                        try:
+                            _enforce_band_span(letter, "stop")
+                            _enforce_band_span(letter, "start")
+                        except Exception:
+                            pass
+                    preset_combo.setCurrentIndex(0)
+                except Exception:
+                    try:
+                        preset_combo.setCurrentIndex(0)
+                    except Exception:
+                        pass
+
+            preset_combo.currentIndexChanged.connect(_apply_preset)
+
+            hdr_l.addWidget(preset_combo)
+            hdr_l.addStretch(1)
+            hdr_l.addWidget(dev_lbl)
+            hdr_l.addWidget(device_combo)
+            hdr_l.addWidget(start_btn)
+            hdr_l.addWidget(stop_btn)
+
+            # Details row (collapsible)
+            details = QtWidgets.QWidget()
+            details_g = QtWidgets.QGridLayout(details)
+            details_g.setContentsMargins(26, 2, 0, 6)
+            details_g.setHorizontalSpacing(10)
+            details_g.setVerticalSpacing(6)
+
+            details_g.addWidget(QtWidgets.QLabel("Start (MHz)"), 0, 0)
+            details_g.addWidget(start_edit, 0, 1)
+            details_g.addWidget(QtWidgets.QLabel("Stop (MHz)"), 0, 2)
+            details_g.addWidget(stop_edit, 0, 3)
+
+            # Per-band controls (initial set: detection threshold + hold time)
+            det_box = QtWidgets.QGroupBox("Detection")
+            det_g = QtWidgets.QGridLayout(det_box)
+            thr_spin = QtWidgets.QDoubleSpinBox()
+            thr_spin.setRange(-200.0, 100.0)
+            thr_spin.setDecimals(1)
+            thr_spin.setSingleStep(0.5)
+            thr_spin.setValue(float(self.threshold_spin.value()) if hasattr(self, "threshold_spin") else 3.0)
+            hold_spin = QtWidgets.QDoubleSpinBox()
+            hold_spin.setRange(0.0, 60.0)
+            hold_spin.setDecimals(1)
+            hold_spin.setSingleStep(0.1)
+            hold_spin.setValue(float(self.persistence_spin.value()) if hasattr(self, "persistence_spin") else 1.5)
+            use_noise_cb = QtWidgets.QCheckBox("Use local noise floor")
+            use_noise_cb.setChecked(bool(self.use_noise_floor_cb.isChecked()) if hasattr(self, "use_noise_floor_cb") else True)
+            only_show_cb = QtWidgets.QCheckBox("Only show detections above threshold")
+            only_show_cb.setChecked(bool(self.only_above_threshold_cb.isChecked()) if hasattr(self, "only_above_threshold_cb") else False)
+            det_g.addWidget(QtWidgets.QLabel("Threshold (dB)"), 0, 0)
+            det_g.addWidget(thr_spin, 0, 1)
+            det_g.addWidget(QtWidgets.QLabel("Hold time (s)"), 0, 2)
+            det_g.addWidget(hold_spin, 0, 3)
+            det_g.addWidget(use_noise_cb, 1, 0, 1, 2)
+            det_g.addWidget(only_show_cb, 1, 2, 1, 2)
+            details_g.addWidget(det_box, 1, 0, 1, 4)
+
+            # Per-band alarm controls
+            alarm_box = QtWidgets.QGroupBox("Alarm")
+            alarm_g = QtWidgets.QGridLayout(alarm_box)
+            alarm_cb = QtWidgets.QCheckBox("Beep on detection")
+            alarm_cb.setChecked(True)
+            alarm_combo = QtWidgets.QComboBox()
+            # Clone global sound options so per-band stays in sync
+            if hasattr(self, "beep_sound_combo"):
+                for i in range(self.beep_sound_combo.count()):
+                    alarm_combo.addItem(self.beep_sound_combo.itemText(i), self.beep_sound_combo.itemData(i))
+                try:
+                    alarm_combo.setCurrentIndex(int(self.beep_sound_combo.currentIndex()))
+                except Exception:
+                    pass
+            alarm_g.addWidget(alarm_cb, 0, 0, 1, 2)
+            alarm_g.addWidget(QtWidgets.QLabel("Sound"), 1, 0)
+            alarm_g.addWidget(alarm_combo, 1, 1)
+            details_g.addWidget(alarm_box, 2, 0, 1, 4)
+
+            # Device-specific settings (shown based on selected device)
+            dev_box = QtWidgets.QGroupBox("Device settings")
+
+            # Keep device settings panel compact (do not let it consume vertical space).
+            try:
+                dev_box.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+                dev_box.setMinimumHeight(0)
+            except Exception:
+                pass
+            dev_box_l = QtWidgets.QVBoxLayout(dev_box)
+            dev_box.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            dev_box_l.setContentsMargins(8, 6, 8, 8)
+
+            dev_stack = QtWidgets.QStackedWidget()
+            try:
+                dev_stack.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+            except Exception:
+                pass
+            dev_box_l.addWidget(dev_stack)
+
+            dev_blank = QtWidgets.QWidget()
+            dev_stack.addWidget(dev_blank)
+
+            def _set_bias_switch_state(sw: QtWidgets.QPushButton, on: bool) -> None:
+                sw.blockSignals(True)
+                sw.setChecked(bool(on))
+                sw.setText("Bias-T ON" if on else "Bias-T OFF")
+                sw.blockSignals(False)
+
+            def _make_bias_switch() -> QtWidgets.QPushButton:
+                sw = QtWidgets.QPushButton()
+                sw.setCheckable(True)
+                sw.setCursor(QtCore.Qt.PointingHandCursor)
+                sw.setMinimumWidth(110)
+                sw.setMaximumWidth(130)
+                sw.setToolTip("Bias-T antenna power for this band/device.")
+                sw.setStyleSheet(
+                    """
+                    QPushButton {
+                        border-radius: 11px;
+                        border: 1px solid #666;
+                        background: #4a4a4a;
+                        color: #eeeeee;
+                        font-weight: 600;
+                        padding: 3px 10px;
+                    }
+                    QPushButton:checked {
+                        border: 1px solid #4cc470;
+                        background: #1f8a3b;
+                        color: #ffffff;
+                    }
+                    QPushButton:pressed {
+                        padding-top: 4px;
+                        padding-bottom: 2px;
+                    }
+                    """
+                )
+                _set_bias_switch_state(sw, False)
+                return sw
+
+            hackrf_bias_switch = _make_bias_switch()
+            soapy_bias_switch = _make_bias_switch()
+
+            def _sync_bias_switches(src: QtWidgets.QPushButton, dst: QtWidgets.QPushButton) -> None:
+                def _on_toggled(on: bool):
+                    src.setText("Bias-T ON" if on else "Bias-T OFF")
+                    _set_bias_switch_state(dst, on)
+                src.toggled.connect(_on_toggled)
+
+            _sync_bias_switches(hackrf_bias_switch, soapy_bias_switch)
+            _sync_bias_switches(soapy_bias_switch, hackrf_bias_switch)
+
+            # --- HackRF page ---
+            hackrf_page = QtWidgets.QWidget()
+            hg = QtWidgets.QGridLayout(hackrf_page)
+            hg.setHorizontalSpacing(10)
+            hg.setVerticalSpacing(6)
+            hg.setColumnStretch(1, 1)
+            hg.setColumnStretch(3, 1)
+
+            hackrf_mode_combo = QtWidgets.QComboBox()
+            hackrf_mode_combo.addItem("Sweep (hackrf_sweep)", "sweep")
+            hackrf_mode_combo.addItem("Stream (IQ, max 20 MSPS)", "stream")
+
+            hackrf_bin_mode = QtWidgets.QComboBox()
+            hackrf_bin_mode.addItem("Auto", "auto")
+            hackrf_bin_mode.addItem("Manual", "manual")
+
+            hackrf_bin_spin = QtWidgets.QSpinBox()
+            hackrf_bin_spin.setRange(1000, 5000000)
+            hackrf_bin_spin.setSingleStep(1000)
+            hackrf_bin_spin.setValue(250000)
+            hackrf_bin_spin.setMaximumWidth(140)
+
+            hackrf_interval_spin = QtWidgets.QSpinBox()
+            hackrf_interval_spin.setRange(1, 10000)
+            try:
+                hackrf_interval_spin.setValue(int(self.interval_spin.value()))
+            except Exception:
+                hackrf_interval_spin.setValue(250)
+            hackrf_interval_spin.setMaximumWidth(140)
+
+            hackrf_start_delay_spin = QtWidgets.QSpinBox()
+            hackrf_start_delay_spin.setRange(0, 10000)
+            hackrf_start_delay_spin.setValue(0)
+            hackrf_start_delay_spin.setMaximumWidth(140)
+
+            hackrf_gain_spin = QtWidgets.QDoubleSpinBox()
+            hackrf_gain_spin.setRange(0.0, 80.0)
+            hackrf_gain_spin.setDecimals(1)
+            hackrf_gain_spin.setSingleStep(1.0)
+            hackrf_gain_spin.setValue(16.0)
+            hackrf_gain_spin.setMaximumWidth(140)
+
+            hg.addWidget(QtWidgets.QLabel("Mode"), 0, 0)
+            hg.addWidget(hackrf_mode_combo, 0, 1)
+            hg.addWidget(QtWidgets.QLabel("Bin width"), 1, 0)
+            hg.addWidget(hackrf_bin_mode, 1, 1)
+            hg.addWidget(QtWidgets.QLabel("Manual bin (Hz)"), 1, 2)
+            hg.addWidget(hackrf_bin_spin, 1, 3)
+            hg.addWidget(QtWidgets.QLabel("Interval (ms)"), 2, 0)
+            hg.addWidget(hackrf_interval_spin, 2, 1)
+            hg.addWidget(QtWidgets.QLabel("Start delay (ms)"), 2, 2)
+            hg.addWidget(hackrf_start_delay_spin, 2, 3)
+            hg.addWidget(QtWidgets.QLabel("Gain (dB)"), 3, 0)
+            hg.addWidget(hackrf_gain_spin, 3, 1)
+            hg.addWidget(QtWidgets.QLabel("Bias-T power"), 3, 2)
+            hg.addWidget(hackrf_bias_switch, 3, 3)
+
+            dev_stack.addWidget(hackrf_page)
+
+            # --- Soapy page (bladeRF / RTL-SDR / HackRF stream backend) ---
+            soapy_page = QtWidgets.QWidget()
+            sg = QtWidgets.QGridLayout(soapy_page)
+            sg.setHorizontalSpacing(10)
+            sg.setVerticalSpacing(6)
+            sg.setColumnStretch(1, 1)
+
+            soapy_gain_spin = QtWidgets.QDoubleSpinBox()
+            soapy_gain_spin.setRange(0.0, 80.0)
+            soapy_gain_spin.setDecimals(1)
+            soapy_gain_spin.setSingleStep(1.0)
+            soapy_gain_spin.setValue(30.0)
+            soapy_gain_spin.setMaximumWidth(140)
+
+            sg.addWidget(QtWidgets.QLabel("Gain (dB)"), 0, 0)
+            sg.addWidget(soapy_gain_spin, 0, 1)
+            sg.addWidget(QtWidgets.QLabel("Bias-T power"), 0, 2)
+            sg.addWidget(soapy_bias_switch, 0, 3)
+            dev_stack.addWidget(soapy_page)
+
+            def _update_hackrf_controls():
+                is_stream = (str(hackrf_mode_combo.currentData()) == "stream")
+                # Start delay is sweep-only
+                hackrf_start_delay_spin.setEnabled(not is_stream)
+                # Gain is primarily used for stream (sweep uses hackrf_sweep gain implicitly)
+                hackrf_gain_spin.setEnabled(is_stream)
+                # Manual bin width only when selected
+                is_manual = (str(hackrf_bin_mode.currentData()) == "manual")
+                hackrf_bin_spin.setEnabled(is_manual)
+                try:
+                    _fit_device_settings_height()
+                except Exception:
+                    pass
+
+            hackrf_mode_combo.currentIndexChanged.connect(_update_hackrf_controls)
+            hackrf_bin_mode.currentIndexChanged.connect(_update_hackrf_controls)
+            _update_hackrf_controls()
+
+            # Ensure span clamping updates immediately when switching HackRF Sweep/Stream.
+            try:
+                hackrf_mode_combo.currentIndexChanged.connect(lambda _i, b=letter: _enforce_band_span(b, "stop"))
+            except Exception:
+                pass
+
+            def _fit_device_settings_height():
+                """Size device settings panel to the currently visible page content."""
+                try:
+                    current = dev_stack.currentWidget()
+                    if current is None:
+                        return
+                    page_h = int(max(28, current.sizeHint().height()))
+                    # Prevent pathological growth if a style reports an oversized hint.
+                    page_h = int(min(page_h + 2, 260))
+                    dev_stack.setFixedHeight(page_h)
+
+                    m = dev_box_l.contentsMargins()
+                    box_h = int(page_h + m.top() + m.bottom())
+                    box_h = int(max(44, min(box_h, 300)))
+                    dev_box.setMinimumHeight(box_h)
+                    dev_box.setMaximumHeight(box_h)
+                    dev_box.updateGeometry()
+                except Exception:
+                    pass
+
+            def _select_device_page():
+                d = device_combo.currentData()
+                kind = str(d.get("kind", "auto")) if isinstance(d, dict) else "auto"
+                t = (device_combo.currentText() or "").lower()
+                # In parallel mode, Auto will pick a HackRF by default
+                if kind == "hackrf" or kind == "auto" or "hackrf" in t:
+                    dev_stack.setCurrentWidget(hackrf_page)
+                elif kind == "soapy" or "soapy" in t or "rtl" in t or "blade" in t:
+                    dev_stack.setCurrentWidget(soapy_page)
+                else:
+                    dev_stack.setCurrentWidget(dev_blank)
+                _fit_device_settings_height()
+
+            device_combo.currentIndexChanged.connect(_select_device_page)
+            _select_device_page()
+
+            details_g.addWidget(dev_box, 3, 0, 1, 4)
+            # Keep the device settings box from expanding vertically by giving the extra
+            # space to a spacer row below it.
+            try:
+                details_g.setRowStretch(3, 0)
+                details_g.addItem(QtWidgets.QSpacerItem(0, 0, QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Expanding), 4, 0, 1, 4)
+                details_g.setRowStretch(4, 1)
+            except Exception:
+                pass
+
+            # Tighten dev_box height to the currently selected device page
+            try:
+                QtCore.QTimer.singleShot(0, _fit_device_settings_height)
+            except Exception:
+                pass
+
+            extra = {"threshold_spin": thr_spin, "hold_spin": hold_spin, "use_noise_cb": use_noise_cb, "only_show_cb": only_show_cb,
+                     "alarm_cb": alarm_cb, "alarm_combo": alarm_combo,
+                     "status_lbl": status_lbl, "preset_combo": preset_combo,
+                     "hackrf_mode_combo": hackrf_mode_combo, "hackrf_bin_mode": hackrf_bin_mode, "hackrf_bin_spin": hackrf_bin_spin,
+                     "hackrf_interval_spin": hackrf_interval_spin, "hackrf_start_delay_spin": hackrf_start_delay_spin,
+                     "hackrf_gain_spin": hackrf_gain_spin, "hackrf_bias_switch": hackrf_bias_switch,
+                     "soapy_gain_spin": soapy_gain_spin, "soapy_bias_switch": soapy_bias_switch,
+                     "bias_switch": hackrf_bias_switch}
+
+            details.setVisible(False)
+
+            def _update_span():
+                a = float(start_edit.value())
+                b = float(stop_edit.value())
+                span_lbl.setText(f"Span: {a:0.6f}–{b:0.6f} MHz")
+
+            start_edit.valueChanged.connect(_update_span)
+            stop_edit.valueChanged.connect(_update_span)
+            try:
+                start_edit.valueChanged.connect(lambda _v, b=letter: _enforce_band_span(b, "start"))
+                stop_edit.valueChanged.connect(lambda _v, b=letter: _enforce_band_span(b, "stop"))
+            except Exception:
+                pass
+            _update_span()
+
+            def _toggle(opened: bool):
+                details.setVisible(opened)
+                exp_btn.setArrowType(QtCore.Qt.DownArrow if opened else QtCore.Qt.RightArrow)
+
+            exp_btn.toggled.connect(_toggle)
+
+            card_v.addWidget(hdr)
+            card_v.addWidget(details)
+
+            divider = QtWidgets.QFrame()
+            divider.setFrameShape(QtWidgets.QFrame.HLine)
+            divider.setFrameShadow(QtWidgets.QFrame.Sunken)
+            divider.setStyleSheet("color: #2b2b2b;")
+
+            return card, divider, exp_btn, span_lbl, details, extra
+
+        # Create the same widgets/attributes the backend already expects
+        self.bandA_enable = QtWidgets.QCheckBox("Band A")
+        self.bandB_enable = QtWidgets.QCheckBox("Band B")
+        self.bandC_enable = QtWidgets.QCheckBox("Band C")
         self.bandA_enable.setChecked(True)
-        self.bandA_start = QtWidgets.QDoubleSpinBox()
-        self.bandA_start.setDecimals(3)
-        self.bandA_start.setRange(1.0, 6000.0)
-        self.bandA_start.setValue(900.0)
-        self.bandA_stop = QtWidgets.QDoubleSpinBox()
-        self.bandA_stop.setDecimals(3)
-        self.bandA_stop.setRange(1.0, 6000.0)
-        self.bandA_stop.setValue(930.0)
-        bg_layout.addWidget(self.bandA_label, row, 0)
-        bg_layout.addWidget(self.bandA_enable, row, 1)
-        bg_layout.addWidget(self.bandA_start, row, 2)
-        bg_layout.addWidget(self.bandA_stop, row, 3)
-
-        self.bandA_device = QtWidgets.QComboBox()
-        bg_layout.addWidget(self.bandA_device, row, 4)
-
-        row += 1
-        self.bandB_label = QtWidgets.QLabel("Band B")
-        self.bandB_enable = QtWidgets.QCheckBox()
         self.bandB_enable.setChecked(True)
-        self.bandB_start = QtWidgets.QDoubleSpinBox()
-        self.bandB_start.setDecimals(3)
-        self.bandB_start.setRange(1.0, 6000.0)
-        self.bandB_start.setValue(144.0)
-        self.bandB_stop = QtWidgets.QDoubleSpinBox()
-        self.bandB_stop.setDecimals(3)
-        self.bandB_stop.setRange(1.0, 6000.0)
-        self.bandB_stop.setValue(148.0)
-        bg_layout.addWidget(self.bandB_label, row, 0)
-        bg_layout.addWidget(self.bandB_enable, row, 1)
-        bg_layout.addWidget(self.bandB_start, row, 2)
-        bg_layout.addWidget(self.bandB_stop, row, 3)
-
-        self.bandB_device = QtWidgets.QComboBox()
-        bg_layout.addWidget(self.bandB_device, row, 4)
-
-        row += 1
-        self.bandC_label = QtWidgets.QLabel("Band C")
-        self.bandC_enable = QtWidgets.QCheckBox()
         self.bandC_enable.setChecked(True)
+
+        self.bandA_start = QtWidgets.QDoubleSpinBox()
+        self.bandA_stop = QtWidgets.QDoubleSpinBox()
+        self.bandB_start = QtWidgets.QDoubleSpinBox()
+        self.bandB_stop = QtWidgets.QDoubleSpinBox()
         self.bandC_start = QtWidgets.QDoubleSpinBox()
-        self.bandC_start.setDecimals(3)
-        self.bandC_start.setRange(1.0, 6000.0)
-        self.bandC_start.setValue(420.0)
         self.bandC_stop = QtWidgets.QDoubleSpinBox()
-        self.bandC_stop.setDecimals(3)
-        self.bandC_stop.setRange(1.0, 6000.0)
-        self.bandC_stop.setValue(450.0)
-        bg_layout.addWidget(self.bandC_label, row, 0)
-        bg_layout.addWidget(self.bandC_enable, row, 1)
-        bg_layout.addWidget(self.bandC_start, row, 2)
-        bg_layout.addWidget(self.bandC_stop, row, 3)
 
+        for w in (self.bandA_start, self.bandA_stop, self.bandB_start, self.bandB_stop, self.bandC_start, self.bandC_stop):
+            w.setDecimals(6)
+            w.setRange(0.0, 7250.0)
+            w.setSingleStep(0.001)
+            w.setKeyboardTracking(False)
+
+        self.bandA_start.setValue(900.000)
+        self.bandA_stop.setValue(930.000)
+        self.bandB_start.setValue(144.000)
+        self.bandB_stop.setValue(148.000)
+        self.bandC_start.setValue(420.000)
+        self.bandC_stop.setValue(450.000)
+
+        # Device selectors (populated later by refresh_devices)
+        self.bandA_device = QtWidgets.QComboBox()
+        self.bandB_device = QtWidgets.QComboBox()
         self.bandC_device = QtWidgets.QComboBox()
-        bg_layout.addWidget(self.bandC_device, row, 4)
+        for c in (self.bandA_device, self.bandB_device, self.bandC_device):
+            c.setMinimumWidth(240)
 
-        row += 1
-        bg_layout.addWidget(QtWidgets.QLabel("Bin width (Hz)"), row, 0)
-        self.bin_width_spin = QtWidgets.QSpinBox()
-        self.bin_width_spin.setRange(2445, 5_000_000)
-        self.bin_width_spin.setSingleStep(1000)
+        # Per-band Start/Stop buttons (wired up later just like before)
+        self.bandA_start_btn = QtWidgets.QPushButton("Start")
+        self.bandA_stop_btn = QtWidgets.QPushButton("Stop")
+        self.bandB_start_btn = QtWidgets.QPushButton("Start")
+        self.bandB_stop_btn = QtWidgets.QPushButton("Stop")
+        self.bandC_start_btn = QtWidgets.QPushButton("Start")
+        self.bandC_stop_btn = QtWidgets.QPushButton("Stop")
+        for b in (self.bandA_stop_btn, self.bandB_stop_btn, self.bandC_stop_btn):
+            b.setEnabled(False)
+
+
+        # -------------------------------------------------------------------
+        # Span clamping (UI): keep Start/Stop within the selected device's
+        # instantaneous bandwidth. This is intentionally *visible* (spinbox
+        # snaps back) so users understand why the span cannot be larger.
+        # -------------------------------------------------------------------
+        self._last_span_hint_ts = {}  # key: (band, which) -> monotonic seconds
+
+        def _device_max_span_mhz(device_text: str, band_letter: str):
+            t = (device_text or "").lower()
+            # NOTE: keep these conservative; backend has additional safeguards.
+            # HackRF "Stream" mode is clamped to 20 MHz.
+            if "hackrf" in t:
+                try:
+                    ui = self._band_cards.get(str(band_letter), {})
+                    mode = str(ui.get("hackrf_mode_combo").currentData()) if ui.get("hackrf_mode_combo") is not None else "sweep"
+                    if mode == "stream":
+                        return 20.000
+                except Exception:
+                    pass
+                return None  # sweep spans are handled by hackrf_sweep
+            if "rtl" in t or "rtlsdr" in t or "rtl-sdr" in t:
+                return 2.400
+            if "blade" in t:
+                return 61.440
+            return None  # HackRF sweep, unknown, etc.
+
+        def _show_span_hint(widget: QtWidgets.QWidget, msg: str, band: str):
+            # Rate-limit hints so we don't spam while the user scrolls.
+            key = (band, id(widget))
+            now = time.monotonic()
+            last = self._last_span_hint_ts.get(key, 0.0)
+            if now - last < 1.0:
+                return
+            self._last_span_hint_ts[key] = now
+
+            try:
+                gpos = widget.mapToGlobal(QtCore.QPoint(0, widget.height()))
+                QtWidgets.QToolTip.showText(gpos, msg, widget, widget.rect(), 2500)
+            except Exception:
+                pass
+            # Also log once (same rate-limit)
+            try:
+                self.append_log(msg)
+            except Exception:
+                pass
+
+        def _refresh_band_span_label(band: str) -> None:
+            """Keep the card header span label in sync with spinbox values."""
+            try:
+                ui = getattr(self, "_band_cards", {}).get(str(band), {})
+                span_lbl = ui.get("span")
+                if span_lbl is None:
+                    return
+                if band == "A":
+                    start_spin, stop_spin = self.bandA_start, self.bandA_stop
+                elif band == "B":
+                    start_spin, stop_spin = self.bandB_start, self.bandB_stop
+                else:
+                    start_spin, stop_spin = self.bandC_start, self.bandC_stop
+                span_lbl.setText(f"Span: {float(start_spin.value()):0.6f}–{float(stop_spin.value()):0.6f} MHz")
+            except Exception:
+                pass
+
+        def _enforce_band_span(band: str, changed: str):
+            # changed: "start" or "stop"
+            if band == "A":
+                start_spin, stop_spin, dev_combo = self.bandA_start, self.bandA_stop, self.bandA_device
+            elif band == "B":
+                start_spin, stop_spin, dev_combo = self.bandB_start, self.bandB_stop, self.bandB_device
+            else:
+                start_spin, stop_spin, dev_combo = self.bandC_start, self.bandC_stop, self.bandC_device
+
+            max_span = _device_max_span_mhz(dev_combo.currentText(), band)
+            if not max_span:
+                return
+
+            def _sync_soapy_rate_to_span(span_mhz: float) -> None:
+                """Keep Soapy sample-rate/BW controls matched to the requested span (visible UX)."""
+                try:
+                    dev_t = (dev_combo.currentText() or "").lower()
+                    # Only sync when this band is assigned to a Soapy-style device.
+                    if not ("soapy" in dev_t or "blade" in dev_t or "rtl" in dev_t):
+                        return
+                    target = float(min(span_mhz, max_span))
+                    # Avoid fighting the user while typing; we only call on editingFinished/device change.
+                    self.soapy_rate_spin.blockSignals(True)
+                    self.soapy_bw_spin.blockSignals(True)
+                    self.soapy_rate_spin.setValue(round(target, 3))
+                    # Default BW tracks SR for full-span coverage.
+                    self.soapy_bw_spin.setValue(round(min(target, float(self.soapy_rate_spin.value())), 3))
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        self.soapy_rate_spin.blockSignals(False)
+                        self.soapy_bw_spin.blockSignals(False)
+                    except Exception:
+                        pass
+
+
+            lo = float(start_spin.value())
+            hi = float(stop_spin.value())
+
+            # If user crosses them, allow it, but still enforce max span.
+            span = abs(hi - lo)
+            _sync_soapy_rate_to_span(span)
+            if span <= max_span + 1e-9:
+                return
+
+            # Snap back the value the user most recently changed.
+            if changed == "stop":
+                if hi >= lo:
+                    new_hi = lo + max_span
+                else:
+                    new_hi = lo - max_span
+                stop_spin.blockSignals(True)
+                stop_spin.setValue(round(new_hi, 3))
+                stop_spin.blockSignals(False)
+                _refresh_band_span_label(band)
+                _sync_soapy_rate_to_span(max_span)
+                _show_span_hint(
+                    stop_spin,
+                    f"Band {band}: span clamped to {max_span:.3f} MHz (device limit).",
+                    band,
+                )
+            else:
+                if hi >= lo:
+                    new_lo = hi - max_span
+                else:
+                    new_lo = hi + max_span
+                start_spin.blockSignals(True)
+                start_spin.setValue(round(new_lo, 3))
+                start_spin.blockSignals(False)
+                _refresh_band_span_label(band)
+                _sync_soapy_rate_to_span(max_span)
+                _show_span_hint(
+                    start_spin,
+                    f"Band {band}: span clamped to {max_span:.3f} MHz (device limit).",
+                    band,
+                )
+
+        # Wire up enforcement for all bands (after edits and when device changes)
+        for _band, _start, _stop, _dev in (
+            ("A", self.bandA_start, self.bandA_stop, self.bandA_device),
+            ("B", self.bandB_start, self.bandB_stop, self.bandB_device),
+            ("C", self.bandC_start, self.bandC_stop, self.bandC_device),
+        ):
+            _start.editingFinished.connect(lambda b=_band: _enforce_band_span(b, "start"))
+            _stop.editingFinished.connect(lambda b=_band: _enforce_band_span(b, "stop"))
+            # Also clamp while dragging/spinning so it doesn't feel "stuck" until focus changes.
+            _start.valueChanged.connect(lambda _v, b=_band: _enforce_band_span(b, "start"))
+            _stop.valueChanged.connect(lambda _v, b=_band: _enforce_band_span(b, "stop"))
+            _dev.currentIndexChanged.connect(lambda _i, b=_band: _enforce_band_span(b, "stop"))
+        # Build cards (A/B/C)
+        self._band_cards = {}
+        for _letter, _enable, _start, _stop, _dev, _sbtn, _tbtn in (
+            ("A", self.bandA_enable, self.bandA_start, self.bandA_stop, self.bandA_device, self.bandA_start_btn, self.bandA_stop_btn),
+            ("B", self.bandB_enable, self.bandB_start, self.bandB_stop, self.bandB_device, self.bandB_start_btn, self.bandB_stop_btn),
+            ("C", self.bandC_enable, self.bandC_start, self.bandC_stop, self.bandC_device, self.bandC_start_btn, self.bandC_stop_btn),
+        ):
+            _card, _div, _exp, _span, _details, extra = _build_band_card(_letter, _enable, _start, _stop, _dev, _sbtn, _tbtn)
+            bg_v.addWidget(_card)
+            bg_v.addWidget(_div)
+            self._band_cards[_letter] = {"card": _card, "divider": _div, "expand": _exp, "span": _span, "details": _details, **extra}
+
+        # Legacy global bin width controls (kept hidden for compatibility)
+        # The UI used to expose a global "Bin width / Auto / Max bins" row. We now use per-band settings,
+        # but some helper code may still reference these attributes. Keep them alive and hidden.
+        self._legacy_bin_controls = QtWidgets.QWidget(self)
+        self._legacy_bin_controls.hide()
+        _bin_l = QtWidgets.QHBoxLayout(self._legacy_bin_controls)
+        _bin_l.setContentsMargins(0, 0, 0, 0)
+        _bin_l.setSpacing(0)
+
+        self.bin_width_spin = QtWidgets.QSpinBox(self._legacy_bin_controls)
+        self.bin_width_spin.setRange(1000, 5_000_000)
         self.bin_width_spin.setValue(250_000)
-        bg_layout.addWidget(self.bin_width_spin, row, 1)
+        self.bin_width_spin.setSingleStep(1000)
+        self.bin_width_spin.setKeyboardTracking(False)
 
-        self.auto_bin_checkbox = QtWidgets.QCheckBox("Auto")
+        self.auto_bin_checkbox = QtWidgets.QCheckBox("Auto", self._legacy_bin_controls)
         self.auto_bin_checkbox.setChecked(True)
-        bg_layout.addWidget(self.auto_bin_checkbox, row, 2)
 
-        self.max_bins_spin = QtWidgets.QSpinBox()
-        self.max_bins_spin.setRange(50, 2000)
-        self.max_bins_spin.setSingleStep(50)
+        self.max_bins_spin = QtWidgets.QSpinBox(self._legacy_bin_controls)
+        self.max_bins_spin.setRange(100, 20000)
         self.max_bins_spin.setValue(400)
-        bg_layout.addWidget(self.max_bins_spin, row, 3)
+        self.max_bins_spin.setKeyboardTracking(False)
+
 
         main_layout.addWidget(band_group)
 
-        # ---------------- Bottom splitter ----------------
+        # Keep the mapping dictionaries used by the rest of the program
+        self._band_buttons = {
+            "A": (self.bandA_start_btn, self.bandA_stop_btn),
+            "B": (self.bandB_start_btn, self.bandB_stop_btn),
+            "C": (self.bandC_start_btn, self.bandC_stop_btn),
+        }
+
+        self._band_enable_checks = {"A": self.bandA_enable, "B": self.bandB_enable, "C": self.bandC_enable}
+        self._band_start_edits = {"A": self.bandA_start, "B": self.bandB_start, "C": self.bandC_start}
+        self._band_stop_edits  = {"A": self.bandA_stop,  "B": self.bandB_stop,  "C": self.bandC_stop}
+        self._band_device_combos = {"A": self.bandA_device, "B": self.bandB_device, "C": self.bandC_device}
+
+        # Per-device worker state (parallel mode)
+        self._dev_workers = {}     # device_id -> Worker
+        self._band_to_device = {}  # band -> device_id
+        self._device_to_band = {}  # device_id -> band
+
+        # Per-band activity tracking for UI status line
+        self._band_last_activity_ts = {"A": None, "B": None, "C": None}
+
+        self._band_rate_ema = {'A': 0.0, 'B': 0.0, 'C': 0.0}
+        self._band_rate_last_t = {'A': time.time(), 'B': time.time(), 'C': time.time()}
+        self._band_rate_count = {'A': 0, 'B': 0, 'C': 0}
+        self._band_status_timer = QtCore.QTimer(self)
+        self._band_status_timer.setInterval(1000)
+        self._band_status_timer.timeout.connect(self._update_band_status_age)
+        self._band_status_timer.start()
+
+# ---------------- Bottom splitter ----------------
         bottom_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
 
         self.table = QtWidgets.QTableWidget(0, 3)
@@ -1777,8 +2486,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_detection_context_menu)
         self.refresh_devices_btn.clicked.connect(self.refresh_device_list)
+        if hasattr(self, 'refresh_devices_btn_top'):
+            self.refresh_devices_btn_top.clicked.connect(self.refresh_device_list)
+        # Per-band start/stop buttons (only active in Parallel mode)
+        self.bandA_start_btn.clicked.connect(lambda: self._parallel_start_band_by_name("A"))
+        self.bandA_stop_btn.clicked.connect(lambda: self._parallel_stop_band_by_name("A"))
+        self.bandB_start_btn.clicked.connect(lambda: self._parallel_start_band_by_name("B"))
+        self.bandB_stop_btn.clicked.connect(lambda: self._parallel_stop_band_by_name("B"))
+        self.bandC_start_btn.clicked.connect(lambda: self._parallel_start_band_by_name("C"))
+        self.bandC_stop_btn.clicked.connect(lambda: self._parallel_stop_band_by_name("C"))
         self.device_type_combo.currentIndexChanged.connect(self._on_device_type_changed)
-        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         self.perf_combo.currentIndexChanged.connect(self._on_perf_preset_changed)
         self.advanced_toggle.toggled.connect(self._toggle_advanced)
         self.ui_refresh_spin.valueChanged.connect(self._on_perf_param_changed)
@@ -1796,14 +2513,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.atak_btn.clicked.connect(self.show_atak_bridge)
 
         self.cf_tuner_btn.clicked.connect(self.show_cf_tuner)
-        self.soapy_args_edit.textChanged.connect(self.refresh_band_device_dropdowns)
-
         self.on_auto_bin_toggled(self.auto_bin_checkbox.isChecked())
         self.on_use_noise_floor_toggled(self.use_noise_floor_cb.isChecked())
         self.on_cal_changed()
         self.update_effective_threshold_label()
 
+
     def show_atak_bridge(self):
+        # Create the window lazily. Closing the window should not stop the bridge.
+        if self.atak_window is None:
+            self.atak_window = AtakBridgeWindow(self.atak_bridge, parent=self)
+            # If the user closes the window, let Qt destroy it; we keep the bridge running.
+            try:
+                self.atak_window.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+            except Exception:
+                pass
+            try:
+                self.atak_window.destroyed.connect(lambda *_: setattr(self, "atak_window", None))
+            except Exception:
+                pass
+
         self.atak_window.show()
         self.atak_window.raise_()
         self.atak_window.activateWindow()
@@ -1944,30 +2673,176 @@ class MainWindow(QtWidgets.QMainWindow):
         # Apply max span log throttling to workers
         try:
             period = self._current_max_log_period_s()
-            if getattr(self, "worker", None) is not None and hasattr(self.worker, "max_log_period_s"):
-                self.worker.max_log_period_s = float(period)
-            for w in getattr(self, "parallel_workers", []) or []:
-                if hasattr(w, "max_log_period_s"):
+            for info in getattr(self, "_dev_workers", {}).values():
+                w = info.get("worker") if isinstance(info, dict) else None
+                if w is not None and hasattr(w, "max_log_period_s"):
                     w.max_log_period_s = float(period)
         except Exception:
             pass
 
+    def _show_preflight_error(self, title: str, lines: List[str]) -> None:
+        clean = [str(x) for x in lines if str(x).strip()]
+        for ln in clean:
+            self.append_log(f"[preflight] {ln}")
+        text = "\n".join(clean[:12])
+        if len(clean) > 12:
+            text += "\n..."
+        QtWidgets.QMessageBox.critical(self, title, text)
+
+    def _preflight_hackrf(self, context: str) -> bool:
+        rep = check_hackrf_backend(require_device=True)
+        if bool(rep.get("ok")):
+            return True
+        lines = [f"{context}: HackRF backend is not ready."]
+        lines.extend(rep.get("details") or [])
+        self._show_preflight_error("HackRF backend not ready", lines)
+        return False
+
+    def _soapy_driver_matches(self, requested: str, available: str) -> bool:
+        r = (requested or "").strip().lower()
+        a = (available or "").strip().lower()
+        if not r or not a:
+            return False
+        if r == a:
+            return True
+        if "rtl" in r and "rtl" in a:
+            return True
+        if "bladerf" in r and "bladerf" in a:
+            return True
+        return False
+
+    def _validate_soapy_target(self, soapy_args: str, devices: List[Dict[str, Any]]) -> Optional[str]:
+        args = str(soapy_args or "").strip() or "driver=bladerf"
+        kv = _parse_soapy_args(args)
+        driver = str(kv.get("driver") or "").strip()
+        serial = str(kv.get("serial") or "").strip()
+
+        if not driver:
+            return f"Invalid Soapy args '{args}': missing driver=..."
+
+        if "hackrf" in driver.lower():
+            return (
+                "Soapy assignment with driver=hackrf is not allowed here. "
+                "Assign HackRF directly via the HackRF backend instead."
+            )
+
+        if not devices:
+            return "No Soapy devices were discovered."
+
+        matches: List[Dict[str, Any]] = []
+        for dev in devices:
+            dd = str(dev.get("driver_lower") or dev.get("driver") or "").strip().lower()
+            if self._soapy_driver_matches(driver, dd):
+                matches.append(dev)
+
+        if not matches:
+            return f"No Soapy device with driver '{driver}' was discovered."
+
+        if serial:
+            for dev in matches:
+                if str(dev.get("serial") or "").strip() == serial:
+                    return None
+            return f"Soapy device driver={driver},serial={serial} was not discovered."
+
+        return None
+
+    def _preflight_soapy_runtime(self, context: str, *, require_util: bool = True) -> Optional[Dict[str, Any]]:
+        rep = check_soapy_backend(
+            require_rtlsdr=False,
+            require_bladerf=False,
+            require_util=bool(require_util),
+        )
+        if bool(rep.get("ok")):
+            return rep
+        lines = [f"{context}: Soapy backend is not ready."]
+        lines.extend(rep.get("details") or [])
+        self._show_preflight_error("Soapy backend not ready", lines)
+        return None
+
+    def _preflight_soapy_for_args(self, context: str, soapy_args: str) -> bool:
+        rep = self._preflight_soapy_runtime(context, require_util=True)
+        if rep is None:
+            return False
+        err = self._validate_soapy_target(soapy_args, list(rep.get("devices") or []))
+        if err:
+            self._show_preflight_error("Soapy device check failed", [f"{context}: {err}"])
+            return False
+        return True
+
+    def _preflight_parallel_bands(self, bands: List[Dict[str, Any]]) -> bool:
+        need_hackrf = False
+        need_auto = False
+        soapy_args: List[str] = []
+
+        for b in bands:
+            assign = b.get("assign")
+            kind = str(assign.get("kind")) if isinstance(assign, dict) else "auto"
+            if kind == "soapy":
+                soapy_args.append(str(assign.get("args") or "").strip())
+            elif kind == "hackrf":
+                need_hackrf = True
+            else:
+                need_auto = True
+
+        if need_hackrf and (not self._preflight_hackrf("Parallel mode")):
+            return False
+
+        if soapy_args:
+            rep = self._preflight_soapy_runtime("Parallel mode", require_util=True)
+            if rep is None:
+                return False
+            devices = list(rep.get("devices") or [])
+            for args in soapy_args:
+                err = self._validate_soapy_target(args, devices)
+                if err:
+                    self._show_preflight_error("Soapy device check failed", [f"Parallel mode: {err}"])
+                    return False
+
+        if need_auto:
+            # Auto assignment may choose from HackRF and/or Soapy devices.
+            if not list_hackrf_devices() and not list_soapy_devices():
+                self._show_preflight_error(
+                    "No devices",
+                    [
+                        "Parallel mode: one or more bands use Auto assignment, "
+                        "but no HackRF or Soapy devices were discovered."
+                    ],
+                )
+                return False
+
+        return True
+
+    def _preflight_parallel_device_start(self, band: str, device_id: str, hackrf_mode: str) -> bool:
+        if device_id.startswith("hackrf:"):
+            if not self._preflight_hackrf(f"Band {band}"):
+                return False
+            if str(hackrf_mode).strip().lower() == "stream":
+                if self._preflight_soapy_runtime(f"Band {band} HackRF stream mode", require_util=False) is None:
+                    return False
+            return True
+
+        if device_id.startswith("soapy:"):
+            soapy_args = device_id.split(":", 1)[1]
+            return self._preflight_soapy_for_args(f"Band {band}", soapy_args)
+
+        self._show_preflight_error("No device", [f"Band {band}: no valid backend device was resolved."])
+        return False
+
     def refresh_device_list(self):
-        """Refresh the *single-mode* device selector and the per-band device dropdowns."""
+        """Refresh device selectors used by the parallel workflow."""
         dtype = str(self.device_type_combo.currentText())
 
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
 
         if dtype == DEVICE_SOAPY:
-            self.device_select_label.setText("Soapy device:")
-            # Allow using the free-form args field.
-            custom_args = str(self.soapy_args_edit.text() or "driver=bladerf")
-            self.device_combo.addItem(f"Custom (use args) – {custom_args}", userData=custom_args)
-
+            self.device_select_label.setText("SoapySDR device:")
             soapy = list_soapy_devices()
-            for dev in soapy:
-                self.device_combo.addItem(f"{dev['label']}", userData=str(dev["args_str"]))
+            if not soapy:
+                self.device_combo.addItem("No SoapySDR devices found", userData=None)
+            else:
+                for dev in soapy:
+                    self.device_combo.addItem(f"{dev['label']}", userData=str(dev.get('args_str') or ''))
         else:
             self.device_select_label.setText("HackRF:")
             self.device_combo.addItem("Default (first HackRF)", userData=None)
@@ -2024,12 +2899,9 @@ class MainWindow(QtWidgets.QMainWindow):
             args_str = str(dev.get("args_str") or "")
             if not args_str:
                 continue
-            label = f"SoapySDR – {dev.get('label')}"
+            label = str(dev.get("label") or args_str)
             opts.append({"label": label, "data": {"kind": "soapy", "args": args_str}})
 
-        # Always include a "custom args" option so users can type args manually.
-        custom = str(self.soapy_args_edit.text() or "driver=bladerf")
-        opts.append({"label": f"SoapySDR – Custom ({custom})", "data": {"kind": "soapy", "args": custom}})
 
         return opts
 
@@ -2065,31 +2937,48 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._apply_band_assignment_enabled()
 
+    def _soapy_rate_for_band(self, band_cfg: dict, soapy_args: str) -> float:
+        """Pick a sample-rate/BW that covers the band span, clamped to device capability."""
+        try:
+            span_hz = float(band_cfg.get("stop_hz", 0.0)) - float(band_cfg.get("start_hz", 0.0))
+            if span_hz <= 0:
+                span_hz = (float(band_cfg.get("stop_mhz", 0.0)) - float(band_cfg.get("start_mhz", 0.0))) * 1e6
+        except Exception:
+            span_hz = 0.0
+        span_hz = max(span_hz, 200e3)
+
+        args_l = (soapy_args or "").lower()
+        cap = 20e6
+        if "rtlsdr" in args_l or "rtl-sdr" in args_l or "rtl" in args_l:
+            cap = 2.4e6
+        elif "bladerf" in args_l or "blade" in args_l:
+            cap = 61.44e6
+        elif "hackrf" in args_l:
+            cap = 20e6
+
+        # Must be >= span, but do not exceed device cap.
+        return float(min(cap, max(span_hz, 0.0)))
+
     def _apply_band_assignment_enabled(self) -> None:
-        # Enable per-band assignment dropdowns only in Parallel mode
-        mode = str(self.mode_combo.currentText())
-        enabled = (mode == MODE_PARALLEL)
+        # Keep per-band assignment dropdowns interactive in both modes so users can
+        # inspect/prepare device mappings at any time. Running bands are still
+        # locked by _parallel_update_ui() to prevent mid-run changes.
+        enabled = True
         for cb in self._band_device_widgets():
             cb.setEnabled(enabled)
 
     def _on_device_type_changed(self, _idx: int = 0) -> None:
         """Show/hide device-specific UI controls.
 
-        - In Single mode: Device Type selects the backend (HackRF vs SoapySDR).
-        - In Parallel mode: per-band Device dropdowns drive assignment; we keep both
-          HackRF and Soapy controls visible.
+        Parallel-only runtime: per-band Device dropdowns drive assignment, and
+        this selector controls which backend settings are emphasized.
         """
         dtype = str(self.device_type_combo.currentText())
-        mode = str(self.mode_combo.currentText())
-        is_parallel = (mode == MODE_PARALLEL)
         is_soapy = (dtype == DEVICE_SOAPY)
 
-        # In parallel mode we always show Soapy controls (you might assign a band to Soapy),
-        # and we keep HackRF controls available too.
-        show_soapy_controls = is_parallel or is_soapy
-
-        self.soapy_args_label.setVisible(show_soapy_controls)
-        self.soapy_args_edit.setVisible(show_soapy_controls)
+        # Parallel mode is always active; keep Soapy controls visible so mixed
+        # backend assignments (HackRF + Soapy) can be configured.
+        show_soapy_controls = True
         self.soapy_rate_label.setVisible(show_soapy_controls)
         self.soapy_rate_spin.setVisible(show_soapy_controls)
         self.soapy_bw_label.setVisible(show_soapy_controls)
@@ -2110,491 +2999,560 @@ class MainWindow(QtWidgets.QMainWindow):
         # - Soapy: select an enumerated Soapy device (or Custom args)
         self.refresh_devices_btn.setEnabled(True)
         self.device_combo.setEnabled(True)
-        # Bias-T only applies to HackRF devices; we leave the checkbox enabled but it will be ignored for Soapy.
+        # Legacy global Bias-T checkbox is retained for compatibility; per-band switches are authoritative.
 
-        if not is_parallel and is_soapy:
+        if is_soapy:
             self.append_log("SoapySDR selected: running in time-slice mode (experimental).")
 
         # Keep lists fresh when switching backend
         self.refresh_device_list()
 
-    def _on_mode_changed(self, _idx: int = 0) -> None:
-        mode = str(self.mode_combo.currentText())
-        self.append_log(f"Mode set to: {mode}")
+    # ---------------------------------------------------------------------
+    # Parallel per-device worker manager (one worker per physical device)
+    # ---------------------------------------------------------------------
 
-        if mode == MODE_PARALLEL:
-            # In Parallel mode you still may want to switch between HackRF vs SoapySDR
-            # (to expose Soapy settings and refresh discovered devices for assignment).
-            self.device_type_combo.setEnabled(True)
-            self.device_type_combo.setToolTip(
-                "In Parallel mode, per-band Device dropdowns choose the hardware. "
-                "This selector controls which backend settings are shown and which devices are discovered."
-            )
-        else:
-            self.device_type_combo.setEnabled(True)
-            self.device_type_combo.setToolTip("Select HackRF vs SoapySDR backend for Single mode.")
+    def _parallel_is_active(self) -> bool:
+        return bool(getattr(self, "_dev_workers", {}))
+    def _parallel_update_ui(self) -> None:
+        """Update band start/stop buttons and global Start/Stop state."""
+        is_parallel = True
 
-        self._apply_band_assignment_enabled()
+        # Band buttons only visible in Parallel mode
+        for band, (sbtn, xbtn) in getattr(self, "_band_buttons", {}).items():
+            try:
+                sbtn.setVisible(is_parallel)
+                xbtn.setVisible(is_parallel)
+            except Exception:
+                pass
 
-        # Update visibility of device controls (Soapy settings shown in Parallel)
-        self._on_device_type_changed(0)
-    def _start_parallel_hackrf(
-        self,
-        *,
-        bands: List[Dict[str, Any]],
-        bin_width_hz: int,
-        threshold_db: float,
-        use_local_noise_floor: bool,
-        only_above_threshold: bool,
-        min_hold_time_s: float,
-        interval_ms: int,
-        antenna_power: bool,
-        cal_gain_db: float,
-        cal_loss_db: float,
-        freq_ppm: float,
-    ) -> None:
-        """Start one SweepWorker per connected HackRF and split enabled bands across them."""
+        # Update per-band enabled state
+        for band in ("A", "B", "C"):
+            sbtn, xbtn = self._band_buttons.get(band, (None, None))
+            if sbtn is None or xbtn is None:
+                continue
+            enabled_cb = getattr(self, f"band{band}_enable", None)
+            is_enabled = bool(enabled_cb.isChecked()) if enabled_cb is not None else False
+            is_running = band in getattr(self, "_band_to_device", {})
 
-        devices = list_hackrf_devices()
-        serials = [d.get("serial") for d in devices if d.get("serial")]
+            # Status line in band header
+            try:
+                ui = getattr(self, "_band_cards", {}).get(band, {})
+                status_lbl = ui.get("status_lbl")
+                if status_lbl is not None:
+                    if is_parallel and is_running:
+                        device_id = self._band_to_device.get(band, "")
+                        info = self._dev_workers.get(device_id, {})
+                        kind = str(info.get("kind") or "")
+                        # Determine mode
+                        mode_txt = "Running"
+                        if kind == "hackrf":
+                            try:
+                                if isinstance(info.get("worker"), SoapyTimeSliceWorker):
+                                    mode_txt = "Running — Stream 20 MSPS"
+                                else:
+                                    mode_txt = "Running — Sweep"
+                            except Exception:
+                                mode_txt = "Running — HackRF"
+                        elif kind == "soapy":
+                            mode_txt = "Running — Soapy"
+                        status_lbl.setProperty("_base_text", mode_txt)
+                    elif is_parallel and is_enabled:
+                        status_lbl.setProperty("_base_text", "Ready")
+                    else:
+                        status_lbl.setProperty("_base_text", "Idle")
+            except Exception:
+                pass
 
-        # Fallback: if hackrf_info parsing failed, honor the user's selected device (or default)
-        if not serials:
-            selected = self.device_combo.currentData()
-            if selected:
-                serials = [str(selected)]
-            else:
-                serials = [None]
-
-        # Split bands round-robin across available devices
-        assignments: Dict[Optional[str], List[Dict[str, Any]]] = {}
-        for i, band in enumerate(bands):
-            serial = serials[i % len(serials)]
-            key = str(serial) if serial is not None else None
-            assignments.setdefault(key, []).append(band)
-
-        used = [(serial, blist) for serial, blist in assignments.items() if blist]
-        if not used:
-            QtWidgets.QMessageBox.warning(self, "Parallel mode", "No enabled bands to assign.")
-            self.status_label.setText("Idle")
-            self.start_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
-            return
-
-        # Reset any prior parallel state
-        self._parallel_finished = 0
-        self._noise_by_source = {}
-        self.parallel_threads = []
-        self.parallel_workers = []
-        self.parallel_serials = [serial for (serial, _bl) in used]
-        self._parallel_active = True
-
-        # Bias-tee handling: enable per device (if requested)
-        self.bias_tee_requested = bool(antenna_power)
-        self.bias_tee_engaged = False
-        if antenna_power:
-            for serial in self.parallel_serials:
+            # Lock band controls while running (prevents changing device/span mid-run)
+            if is_parallel:
                 try:
-                    ok = set_bias_tee(True, self.append_log, serial=serial)
-                    self.bias_tee_engaged = self.bias_tee_engaged or bool(ok)
+                    dev_cb = getattr(self, f"band{band}_device", None)
+                    start_spin = getattr(self, f"band{band}_start", None)
+                    stop_spin = getattr(self, f"band{band}_stop", None)
+                    if dev_cb is not None:
+                        dev_cb.setEnabled(not is_running)
+                    if start_spin is not None:
+                        start_spin.setEnabled(not is_running)
+                    if stop_spin is not None:
+                        stop_spin.setEnabled(not is_running)
                 except Exception:
                     pass
 
-        # Start workers
-        for idx, (serial, blist) in enumerate(used):
-            label = str(serial) if serial else f"HackRF-{idx}"
+            # Start enabled when band enabled, not running
+            try:
+                sbtn.setEnabled(is_parallel and is_enabled and (not is_running))
+                xbtn.setEnabled(is_parallel and is_running)
+            except Exception:
+                pass
 
-            thread = QtCore.QThread(self)
-            worker = SweepWorker(
-                bands=blist,
+        # Global buttons act as Start All / Stop All in Parallel mode
+        try:
+            if is_parallel:
+                self.start_btn.setText("Start all")
+                self.stop_btn.setText("Stop all")
+                any_enabled = any(getattr(self, f"band{b}_enable").isChecked() for b in ("A","B","C"))
+                any_running = bool(getattr(self, "_dev_workers", {}))
+                self.start_btn.setEnabled(any_enabled and (not (all(b in self._band_to_device for b in ("A","B","C") if getattr(self, f"band{b}_enable").isChecked()))))
+                self.stop_btn.setEnabled(any_running)
+            else:
+                self.start_btn.setText("Start")
+                self.stop_btn.setText("Stop")
+        except Exception:
+            pass
+    
+    def _update_band_status_age(self) -> None:
+        """Update per-band status label with last-activity age and a simple rate indicator."""
+        try:
+            now = time.time()
+        except Exception:
+            return
+
+        # Update per-band frame-rate estimate (EMA of frames per second)
+        try:
+            for b in ("A", "B", "C"):
+                last_t = float(self._band_rate_last_t.get(b, now))
+                dt = max(1e-3, now - last_t)
+                cnt = int(self._band_rate_count.get(b, 0))
+                inst = float(cnt) / dt
+                prev = float(self._band_rate_ema.get(b, 0.0))
+                alpha = 0.30
+                self._band_rate_ema[b] = (1.0 - alpha) * prev + alpha * inst
+                self._band_rate_last_t[b] = now
+                self._band_rate_count[b] = 0
+        except Exception:
+            pass
+
+        for band in ("A", "B", "C"):
+            ui = getattr(self, "_band_cards", {}).get(band, {})
+            lbl = ui.get("status_lbl")
+            if lbl is None:
+                continue
+            base = lbl.property("_base_text") or lbl.text() or ""
+            age_ts = getattr(self, "_band_last_activity_ts", {}).get(band)
+            if base.startswith("Running") and age_ts:
+                try:
+                    age = max(0.0, now - float(age_ts))
+                    fps = float(getattr(self, "_band_rate_ema", {}).get(band, 0.0) or 0.0)
+                    if fps > 0.0:
+                        lbl.setText(f"{base}  ({fps:0.1f}/s, age {age:0.1f}s)")
+                    else:
+                        lbl.setText(f"{base}  (age {age:0.1f}s)")
+                except Exception:
+                    lbl.setText(base)
+            else:
+                lbl.setText(str(base))
+
+    def _parallel_band_config_from_ui(self, band: str) -> dict:
+        enabled_cb = getattr(self, f"band{band}_enable")
+        start_spin = getattr(self, f"band{band}_start")
+        stop_spin = getattr(self, f"band{band}_stop")
+        dev_cb = getattr(self, f"band{band}_device")
+        start_mhz = float(start_spin.value())
+        stop_mhz = float(stop_spin.value())
+        return {
+            "name": band,
+            "enabled": bool(enabled_cb.isChecked()),
+            "start_mhz": start_mhz,
+            "stop_mhz": stop_mhz,
+            "start_hz": start_mhz * 1e6,
+            "stop_hz": stop_mhz * 1e6,
+            "assign": dev_cb.currentData(),
+        }
+    def _parallel_device_id_from_assign(self, assign: dict) -> str:
+        if not isinstance(assign, dict):
+            return "auto"
+        kind = str(assign.get("kind", "auto"))
+        if kind == "hackrf":
+            serial = str(assign.get("serial") or "").strip()
+            return f"hackrf:{serial}" if serial else "auto"
+        if kind == "soapy":
+            args = str(assign.get("args") or "").strip()
+            return f"soapy:{args}" if args else "auto"
+        return "auto"
+    def _parallel_auto_device_pool(self) -> List[str]:
+        pool: List[str] = []
+        for d in list_hackrf_devices():
+            s = str(d.get("serial") or "").strip()
+            if s:
+                pool.append(f"hackrf:{s}")
+        for d in list_soapy_devices():
+            args = str(d.get("args_str") or "").strip()
+            if args:
+                pool.append(f"soapy:{args}")
+        return pool
+
+    def _parallel_pick_auto_device(self, used_device_ids: set) -> str:
+        for did in self._parallel_auto_device_pool():
+            if did not in used_device_ids:
+                return did
+        return ""
+    def _parallel_start_band_by_name(self, band: str) -> None:
+        """Start a single band in Parallel mode (one worker per device)."""
+        cfg = self._parallel_band_config_from_ui(band)
+        if not cfg.get("enabled"):
+            self.append_log(f"Band {band} is disabled.")
+            self._parallel_update_ui()
+            return
+        if cfg["stop_mhz"] <= cfg["start_mhz"]:
+            self.append_log(f"Band {band} has invalid range.")
+            self._parallel_update_ui()
+            return
+        if band in self._band_to_device:
+            self._parallel_update_ui()
+            return
+
+        self.append_log(f"Band {band} worker starting...")
+
+        ui = getattr(self, "_band_cards", {}).get(band, {})
+
+        # Bin width (per-band)
+        try:
+            bin_mode = str(ui.get("hackrf_bin_mode").currentData())
+        except Exception:
+            bin_mode = "auto"
+        if bin_mode == "manual":
+            try:
+                bin_width = int(ui.get("hackrf_bin_spin").value())
+            except Exception:
+                bin_width = 250000
+        else:
+            bin_width = int(self.choose_auto_bin_width([cfg], max_bins=400))
+        self.current_bin_width = int(bin_width)
+
+        # Per-band detection settings
+        thr = float(ui.get("threshold_spin").value()) if ui.get("threshold_spin") is not None else float(self.threshold_spin.value())
+        hold = float(ui.get("hold_spin").value()) if ui.get("hold_spin") is not None else float(self.persistence_spin.value())
+        use_noise = bool(ui.get("use_noise_cb").isChecked()) if ui.get("use_noise_cb") is not None else bool(self.use_noise_floor_cb.isChecked())
+        only_above = bool(ui.get("only_show_cb").isChecked()) if ui.get("only_show_cb") is not None else bool(self.only_above_threshold_cb.isChecked())
+
+        # HackRF per-band backend mode
+        try:
+            hackrf_mode = str(ui.get("hackrf_mode_combo").currentData())
+        except Exception:
+            hackrf_mode = "sweep"
+
+        # Safety clamp: HackRF stream mode cannot exceed 20 MHz span
+        try:
+            if str(hackrf_mode) == "stream":
+                span_hz = float(cfg.get("stop_hz", 0.0)) - float(cfg.get("start_hz", 0.0))
+                if span_hz > 20e6 + 1.0:
+                    cfg["stop_hz"] = float(cfg.get("start_hz", 0.0)) + 20e6
+                    cfg["stop_mhz"] = cfg["stop_hz"] / 1e6
+                    self.append_log(f"Band {band}: clamped HackRF stream span to 20 MHz.")
+        except Exception:
+            pass
+
+        # Timing/gain
+        try:
+            interval_ms = int(ui.get("hackrf_interval_spin").value())
+        except Exception:
+            interval_ms = int(self.interval_spin.value())
+        try:
+            start_delay_ms = int(ui.get("hackrf_start_delay_spin").value())
+        except Exception:
+            start_delay_ms = 0
+        try:
+            hackrf_gain_db = float(ui.get("hackrf_gain_spin").value())
+        except Exception:
+            hackrf_gain_db = 16.0
+        try:
+            soapy_gain_db = float(ui.get("soapy_gain_spin").value())
+        except Exception:
+            soapy_gain_db = 30.0
+        try:
+            antenna_power = bool(ui.get("bias_switch").isChecked())
+        except Exception:
+            antenna_power = bool(self.bias_tee_checkbox.isChecked())
+
+        params = {
+            "bin_width_hz": int(bin_width),
+            "threshold_db": float(thr),
+            "use_local_noise_floor": bool(use_noise),
+            "only_above_threshold": bool(only_above),
+            "min_hold_time_s": float(hold),
+            "interval_ms": int(interval_ms),
+            "start_delay_ms": int(start_delay_ms),
+            "antenna_power": bool(antenna_power),
+            "cal_gain_db": float(self.cal_gain_spin.value()),
+            "cal_loss_db": float(self.cal_loss_spin.value()),
+            "freq_ppm": float(self.ppm_spin.value()),
+            "hackrf_mode": hackrf_mode,
+            "hackrf_gain_db": float(hackrf_gain_db),
+            "soapy_gain_db": float(soapy_gain_db),
+        }
+
+        # Resolve device
+        assign = cfg.get("assign")
+        device_id = self._parallel_device_id_from_assign(assign)
+        used_device_ids = set(self._dev_workers.keys())
+        if device_id == "auto":
+            device_id = self._parallel_pick_auto_device(used_device_ids)
+
+        if not device_id:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No free device",
+                f"No free device is available for band {band}.\n"
+                "Assign a specific device to this band, or stop a running band first.",
+            )
+            self._parallel_update_ui()
+            return
+
+        if not self._preflight_parallel_device_start(band, device_id, hackrf_mode):
+            self._parallel_update_ui()
+            return
+
+        if device_id in self._dev_workers:
+            self.append_log(
+                f"Band {band} not started: device already in use ({device_id}). "
+                "Choose a different device assignment."
+            )
+            self._parallel_update_ui()
+            return
+
+        ok = self._parallel_start_device_worker(device_id=device_id, band_cfg=cfg, **params)
+        if ok:
+            self.status_label.setText("Running...")
+        self._parallel_update_ui()
+
+    def _parallel_stop_band_by_name(self, band: str) -> None:
+        if band not in self._band_to_device:
+            self._parallel_update_ui()
+            return
+        device_id = self._band_to_device.get(band)
+        if not device_id:
+            self._parallel_update_ui()
+            return
+        info = self._dev_workers.get(device_id)
+        if not info:
+            # stale mapping
+            self._band_to_device.pop(band, None)
+            self._device_to_band.pop(device_id, None)
+            self._parallel_update_ui()
+            return
+        try:
+            self.append_log(f"Stopping band {band} ({device_id})...")
+            self.status_label.setText("Stopping...")
+            info["worker"].stop()
+        except Exception:
+            pass
+        self._parallel_update_ui()
+    def _parallel_start_all(self, bands: list, *, bin_width_hz: int, threshold_db: float, use_local_noise_floor: bool,
+                           only_above_threshold: bool, min_hold_time_s: float, interval_ms: int, antenna_power: bool,
+                           cal_gain_db: float, cal_loss_db: float, freq_ppm: float) -> None:
+        """Start all enabled bands in Parallel mode.
+
+        We delegate to the per-band starter, which reads per-band UI settings (mode/bin/interval/etc).
+        """
+        for b in ("A", "B", "C"):
+            try:
+                if getattr(self, f"band{b}_enable").isChecked():
+                    self._parallel_start_band_by_name(b)
+            except Exception:
+                pass
+
+    def _parallel_start_device_worker(self, *, device_id: str, band_cfg: dict, bin_width_hz: int, threshold_db: float,
+                                     use_local_noise_floor: bool, only_above_threshold: bool, min_hold_time_s: float,
+                                     interval_ms: int, start_delay_ms: int, antenna_power: bool, cal_gain_db: float, cal_loss_db: float,
+                                     freq_ppm: float, hackrf_mode: str = "sweep", hackrf_gain_db: float = 16.0, soapy_gain_db: float = 30.0) -> bool:
+        """Create and start a device-owned worker for one band."""
+        if device_id in self._dev_workers:
+            return False
+
+        kind = "soapy" if device_id.startswith("soapy:") else "hackrf"
+        band = str(band_cfg.get("name") or "")
+
+        thread = QtCore.QThread(self)
+
+        if kind == "hackrf":
+            serial = device_id.split(":", 1)[1]
+            label = serial
+
+            # Bias-tee per device
+            if antenna_power:
+                try:
+                    set_bias_tee(True, self.append_log, serial=serial)
+                except Exception:
+                    pass
+
+            mode = (hackrf_mode or "sweep").strip().lower()
+            if mode == "stream":
+                # HackRF IQ streaming via SoapySDR (clamped to 20 MSPS / 20 MHz span)
+                soapy_args = f"driver=hackrf,serial={serial}"
+                label = f"HackRF(stream) {serial}"
+                span_hz = float(band_cfg.get('stop_hz', 0.0)) - float(band_cfg.get('start_hz', 0.0))
+                fs_hz = float(min(20e6, max(1.0e6, span_hz)))
+
+                worker = SoapyTimeSliceWorker(
+                    bands=[band_cfg],
+                    bin_width_hz=int(bin_width_hz),
+                    threshold_db=float(threshold_db),
+                    use_local_noise_floor=bool(use_local_noise_floor),
+                    only_above_threshold=bool(only_above_threshold),
+                    min_hold_time_s=float(min_hold_time_s),
+                    interval_ms=int(interval_ms),
+                    soapy_args=str(soapy_args),
+                    sample_rate_hz=float(fs_hz),
+                    bandwidth_hz=float(fs_hz),
+                    gain_db=float(hackrf_gain_db),
+                    dwell_ms=250,
+                    settle_ms=40,
+                    fft_size=int(self.soapy_fft_combo.currentData() or 4096),
+                    avg_frames=int(self.soapy_avg_spin.value()),
+                    cal_gain_db=float(cal_gain_db),
+                    cal_loss_db=float(cal_loss_db),
+                    freq_ppm=float(freq_ppm),
+                    antenna_power=bool(antenna_power),
+                    source_id=label,
+                )
+                worker.log_message.connect(lambda msg, l=label: self.append_log(f"[{l}] {msg}"))
+                worker.noise_floor_updated.connect(lambda v, l=label: self._on_parallel_noise_floor(v, l))
+            else:
+                # HackRF sweep backend
+                worker = SweepWorker(
+                    bands=[band_cfg],
+                    bin_width_hz=int(bin_width_hz),
+                    threshold_db=float(threshold_db),
+                    use_local_noise_floor=bool(use_local_noise_floor),
+                    only_above_threshold=bool(only_above_threshold),
+                    min_hold_time_s=float(min_hold_time_s),
+                    interval_ms=int(interval_ms),
+                    start_delay_ms=int(start_delay_ms),
+                    device_arg=serial,
+                    antenna_power=bool(antenna_power),
+                    cal_gain_db=float(cal_gain_db),
+                    cal_loss_db=float(cal_loss_db),
+                    freq_ppm=float(freq_ppm),
+                    source_id=label,
+                )
+                try:
+                    worker.max_log_period_s = float(self._current_max_log_period_s())
+                except Exception:
+                    pass
+                worker.log_message.connect(lambda msg, l=label: self.append_log(f"[{l}] {msg}"))
+                worker.noise_floor_updated.connect(lambda v, l=label: self._on_parallel_noise_floor(v, l))
+
+        else:
+            args = device_id.split(":", 1)[1]
+            soapy_kv = _parse_soapy_args(args)
+            if "hackrf" in str(soapy_kv.get("driver") or "").lower():
+                self.append_log(
+                    f"Refusing Soapy driver=hackrf assignment for band {band}. "
+                    "Use native HackRF backend assignment."
+                )
+                return False
+            label = f"Soapy:{args}"
+            worker = SoapyTimeSliceWorker(
+                bands=[band_cfg],
                 bin_width_hz=int(bin_width_hz),
                 threshold_db=float(threshold_db),
                 use_local_noise_floor=bool(use_local_noise_floor),
                 only_above_threshold=bool(only_above_threshold),
                 min_hold_time_s=float(min_hold_time_s),
                 interval_ms=int(interval_ms),
-                start_delay_ms=int(idx * 350),
-                device_arg=serial,
-                antenna_power=bool(antenna_power),
+                soapy_args=str(args),
+                sample_rate_hz=float(self._soapy_rate_for_band(band_cfg, args)),
+                bandwidth_hz=float(self._soapy_rate_for_band(band_cfg, args)),
+                gain_db=float(soapy_gain_db),
+                dwell_ms=int(self.soapy_dwell_spin.value()),
+                settle_ms=int(self.soapy_settle_spin.value()),
+                fft_size=int(self.soapy_fft_combo.currentData() or 4096),
+                avg_frames=int(self.soapy_avg_spin.value()),
                 cal_gain_db=float(cal_gain_db),
                 cal_loss_db=float(cal_loss_db),
                 freq_ppm=float(freq_ppm),
+                antenna_power=bool(antenna_power),
                 source_id=label,
             )
-            worker.moveToThread(thread)
-
-            thread.started.connect(worker.run)
-
-            # Prefix logs with device label
-            worker.log_message.connect(lambda msg, l=label: self.append_log(f"[{l}] {msg}"))
-
-            # Average noise floor for display
+            worker.log_message.connect(self.append_log)
             worker.noise_floor_updated.connect(lambda v, l=label: self._on_parallel_noise_floor(v, l))
 
-            # Use existing detection pipeline (detections include 'source' now)
-            worker.detections_found.connect(self.on_detections_found)
+        worker.detections_found.connect(self.on_detections_found)
 
-            worker.finished.connect(self._on_parallel_worker_finished)
-            worker.finished.connect(thread.quit)
-            worker.finished.connect(worker.deleteLater)
-            thread.finished.connect(thread.deleteLater)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
 
-            self.parallel_workers.append(worker)
-            self.parallel_threads.append(thread)
-            thread.start()
+        # Finish handling
+        worker.finished.connect(lambda did=device_id: self._parallel_on_device_finished(did))
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
 
-        self.append_log(f"Parallel mode: started {len(self.parallel_workers)} worker(s) across {len(used)} device(s).")
+        # Register
+        self._dev_workers[device_id] = {
+            "thread": thread,
+            "worker": worker,
+            "kind": kind,
+            "band": band,
+            "label": label,
+            "antenna_power": bool(antenna_power),
+        }
+        self._band_to_device[band] = device_id
+        self._device_to_band[device_id] = band
 
+        thread.start()
+        self.append_log(f"Band {band} worker started")
+        self.append_log(f"Band {band} assigned device: {device_id}")
+        return True
 
+    def _parallel_on_device_finished(self, device_id: str) -> None:
+        info = self._dev_workers.pop(device_id, None)
+        band = self._device_to_band.pop(device_id, None)
+        if band:
+            self._band_to_device.pop(band, None)
 
-    def _start_single_soapy(
-        self,
-        bands: List[Dict[str, Any]],
-        bin_width_hz: int,
-        threshold_db: float,
-        use_local_noise_floor: bool,
-        only_above_threshold: bool,
-        min_hold_time_s: float,
-        interval_ms: int,
-        cal_gain_db: float,
-        cal_loss_db: float,
-        freq_ppm: float,
-    ) -> None:
-        # Basic availability check (gives a friendly error early)
+        # Disable bias tee on HackRF as soon as it's free
         try:
-            import numpy  # noqa: F401
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "NumPy not available",
-                "SoapySDR time-slice mode requires NumPy.\n\n" f"Import error: {e}",
-            )
+            if info and info.get("kind") == "hackrf" and bool(info.get("antenna_power")):
+                serial = device_id.split(":", 1)[1]
+                set_bias_tee(False, self.append_log, serial=serial)
+        except Exception:
+            pass
+
+        # If no devices remain, fully return to idle
+        if not self._dev_workers:
+            self.bias_tee_requested = False
+            self.bias_tee_engaged = False
+            self.status_label.setText("Idle")
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+
+        self._parallel_update_ui()
+
+    def _parallel_stop_all(self) -> None:
+        if not self._dev_workers:
+            self.status_label.setText("Idle")
+            self._parallel_update_ui()
             return
 
-        if not soapy_capi_available():
-            QtWidgets.QMessageBox.critical(
-                self,
-                "SoapySDR runtime not available",
-                "SoapySDR time-slice mode requires the SoapySDR runtime (SoapySDR.dll).\n\n"
-                "On Windows, install PothosSDR and ensure 'C:\\Program Files\\PothosSDR\\bin' is on PATH.",
-            )
-            return
-
-# Soapy worker runs without HackRF bias-tee
-        self.bias_tee_requested = False
-        self.bias_tee_engaged = False
-
-        # Prefer the selected Soapy device (if one is chosen); fall back to custom args field.
-        selected = self.device_combo.currentData()
-        if isinstance(selected, str) and selected.strip():
-            soapy_args = str(selected).strip()
-        else:
-            soapy_args = str(self.soapy_args_edit.text() or "driver=bladerf")
-
-        self.worker_thread = QtCore.QThread(self)
-        self.worker = SoapyTimeSliceWorker(
-            bands=bands,
-            bin_width_hz=bin_width_hz,
-            threshold_db=threshold_db,
-            use_local_noise_floor=use_local_noise_floor,
-            only_above_threshold=only_above_threshold,
-            min_hold_time_s=min_hold_time_s,
-            interval_ms=interval_ms,
-            soapy_args=soapy_args,
-            sample_rate_hz=float(self.soapy_rate_spin.value()) * 1e6,
-            bandwidth_hz=float(self.soapy_bw_spin.value()) * 1e6,
-            gain_db=float(self.soapy_gain_spin.value()),
-            dwell_ms=int(self.soapy_dwell_spin.value()),
-            settle_ms=int(self.soapy_settle_spin.value()),
-            fft_size=int(self.soapy_fft_combo.currentData() or 4096),
-            avg_frames=int(self.soapy_avg_spin.value()),
-            cal_gain_db=cal_gain_db,
-            cal_loss_db=cal_loss_db,
-            freq_ppm=freq_ppm,
-            source_id="Soapy",
-        )
-
-        self.worker.moveToThread(self.worker_thread)
-        self.worker_thread.started.connect(self.worker.run)
-        self.worker.log_message.connect(self.append_log)
-        self.worker.noise_floor_updated.connect(self.on_noise_floor_updated)
-        self.worker.detections_found.connect(self.on_detections_found)
-        self.worker.finished.connect(self.on_worker_finished)
-
-        self.worker_thread.start()
-        self.append_log("Single SoapySDR mode started (time-slice).")
-
-    def _start_parallel_manual(
-        self,
-        bands: List[Dict[str, Any]],
-        bin_width_hz: int,
-        threshold_db: float,
-        use_local_noise_floor: bool,
-        only_above_threshold: bool,
-        min_hold_time_s: float,
-        interval_ms: int,
-        antenna_power: bool,
-        cal_gain_db: float,
-        cal_loss_db: float,
-        freq_ppm: float,
-    ) -> None:
-        devices = list_hackrf_devices()
-        hackrf_serials = [d.get("serial") for d in devices if d.get("serial")]
-        hackrf_serials = [str(s) for s in hackrf_serials]
-
-        # Group bands by assignment
-        by_serial: Dict[str, List[Dict[str, Any]]] = {}
-        soapy_by_args: Dict[str, List[Dict[str, Any]]] = {}
-        auto_bands: List[Dict[str, Any]] = []
-
-        for b in bands:
-            a = b.get("assign")
-            kind = str(a.get("kind")) if isinstance(a, dict) else "auto"
-            if kind == "hackrf":
-                serial = str(a.get("serial") or "")
-                if not serial:
-                    auto_bands.append(b)
-                else:
-                    by_serial.setdefault(serial, []).append(b)
-            elif kind == "soapy":
-                args = str(a.get("args") or "").strip()
-                if not args:
-                    args = str(self.soapy_args_edit.text() or "driver=bladerf")
-                soapy_by_args.setdefault(args, []).append(b)
-            else:
-                auto_bands.append(b)
-
-        if auto_bands and not hackrf_serials:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "No HackRF devices",
-                "One or more bands are set to Auto (or HackRF) in Parallel mode, but no HackRF devices were found.",
-            )
-            return
-
-        # Assign auto bands round-robin across available HackRFs
-        if auto_bands:
-            rr = 0
-            for b in auto_bands:
-                serial = hackrf_serials[rr % len(hackrf_serials)]
-                by_serial.setdefault(serial, []).append(b)
-                rr += 1
-
-        
-        # Prevent accidental use of Soapy "hackrf" factory for HackRF devices.
-        # HackRFs should be handled by hackrf_sweep workers for reliability.
-        if soapy_by_args:
-            redirected: Dict[str, List[Dict[str, Any]]] = {}
-            for args, blist in list(soapy_by_args.items()):
-                drv = ""
-                serial = ""
-                for part in args.split(","):
-                    if "=" in part:
-                        k, v = part.split("=", 1)
-                        k = k.strip().lower()
-                        v = v.strip()
-                        if k == "driver":
-                            drv = v.lower()
-                        elif k == "serial":
-                            serial = v
-                if drv == "hackrf":
-                    if serial:
-                        by_serial.setdefault(serial, []).extend(blist)
-                    else:
-                        auto_bands.extend(blist)
-                else:
-                    redirected[args] = blist
-            soapy_by_args = redirected
-# Validate explicit HackRF assignments exist
-        for serial in list(by_serial.keys()):
-            if serial not in hackrf_serials:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "HackRF not found",
-                    f"Band assignment requested HackRF serial {serial}, but it was not detected.\n"
-                    "That band will be skipped.",
-                )
-                del by_serial[serial]
-
-        if soapy_by_args:
-            # Soapy time-slice uses the SoapySDR runtime via ctypes (no python SoapySDR module needed).
+        self.append_log("Stopping all running bands...")
+        self.status_label.setText("Stopping...")
+        for device_id, info in list(self._dev_workers.items()):
+            _ = device_id
             try:
-                import numpy  # noqa: F401
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "NumPy not available",
-                    "One or more bands are assigned to SoapySDR, but NumPy is not available.\n\n" f"Import error: {e}",
-                )
-                return
-
-            if not soapy_capi_available():
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "SoapySDR runtime not available",
-                    "One or more bands are assigned to SoapySDR, but the SoapySDR runtime (SoapySDR.dll) could not be loaded.\n\n"
-                    "On Windows, install PothosSDR and ensure 'C:\\Program Files\\PothosSDR\\bin' is on PATH.",
-                )
-                return
-
-        if not by_serial and not soapy_by_args:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "No workers",
-                "No valid device assignments were available to run.",
-            )
-            return
-
-        # Parallel worker setup
-        self._parallel_active = True
-        self.parallel_threads = []
-        self.parallel_workers = []
-        self.parallel_serials = []
-
-        # Bias-tee only applies to HackRF devices
-        self.bias_tee_requested = bool(self.bias_tee_checkbox.isChecked())
-        self.bias_tee_engaged = False
-
-        if self.bias_tee_requested:
-            ok_any = False
-            for serial in by_serial.keys():
-                if set_bias_tee(True, self.append_log, serial=serial):
-                    ok_any = True
-            self.bias_tee_engaged = ok_any
-
-        # HackRF workers
-        for serial, b_list in by_serial.items():
-            if not b_list:
-                continue
-            self.parallel_serials.append(serial)
-
-            thread = QtCore.QThread(self)
-            worker = SweepWorker(
-                bands=b_list,
-                bin_width_hz=bin_width_hz,
-                threshold_db=threshold_db,
-                use_local_noise_floor=use_local_noise_floor,
-                only_above_threshold=only_above_threshold,
-                min_hold_time_s=min_hold_time_s,
-                interval_ms=interval_ms,
-                device_arg=serial,
-                antenna_power=antenna_power,
-                cal_gain_db=cal_gain_db,
-                cal_loss_db=cal_loss_db,
-                freq_ppm=freq_ppm,
-                source_id=str(serial),
-                start_delay_ms=max(0, (len(self.parallel_serials) - 1) * 350),
-            )
-
-            worker.moveToThread
-            try:
-                worker.max_log_period_s = float(self._current_max_log_period_s())
+                w = info.get("worker") if isinstance(info, dict) else None
+                if w is not None:
+                    w.stop()
             except Exception:
                 pass
-
-            worker.moveToThread(thread)
-            thread.started.connect(worker.run)
-            worker.log_message.connect(self.append_log)
-            worker.noise_floor_updated.connect(lambda v, s=serial: self._on_parallel_noise_floor(v, s))
-            worker.detections_found.connect(self.on_detections_found)
-            worker.finished.connect(self._on_parallel_worker_finished)
-            worker.finished.connect(thread.quit)
-            worker.finished.connect(worker.deleteLater)
-            thread.finished.connect(thread.deleteLater)
-
-            self.parallel_threads.append(thread)
-            self.parallel_workers.append(worker)
-
-        # Soapy workers (one per unique args string)
-        if soapy_by_args:
-            for soapy_args, b_list in soapy_by_args.items():
-                if not b_list:
-                    continue
-
-                thread = QtCore.QThread(self)
-                worker = SoapyTimeSliceWorker(
-                    bands=b_list,
-                    bin_width_hz=bin_width_hz,
-                    threshold_db=threshold_db,
-                    use_local_noise_floor=use_local_noise_floor,
-                    only_above_threshold=only_above_threshold,
-                    min_hold_time_s=min_hold_time_s,
-                    interval_ms=interval_ms,
-                    soapy_args=str(soapy_args),
-                    sample_rate_hz=float(self.soapy_rate_spin.value()) * 1e6,
-                    bandwidth_hz=float(self.soapy_bw_spin.value()) * 1e6,
-                    gain_db=float(self.soapy_gain_spin.value()),
-                    dwell_ms=int(self.soapy_dwell_spin.value()),
-                    settle_ms=int(self.soapy_settle_spin.value()),
-                    fft_size=int(self.soapy_fft_combo.currentData() or 4096),
-                    avg_frames=int(self.soapy_avg_spin.value()),
-                    cal_gain_db=cal_gain_db,
-                    cal_loss_db=cal_loss_db,
-                    freq_ppm=freq_ppm,
-                    source_id=f"Soapy:{soapy_args}",
-                )
-
-                worker.moveToThread(thread)
-                thread.started.connect(worker.run)
-                worker.log_message.connect(self.append_log)
-                worker.noise_floor_updated.connect(lambda v, s=f"Soapy:{soapy_args}": self._on_parallel_noise_floor(v, s))
-                worker.detections_found.connect(self.on_detections_found)
-                worker.finished.connect(self._on_parallel_worker_finished)
-                worker.finished.connect(thread.quit)
-                worker.finished.connect(worker.deleteLater)
-                thread.finished.connect(thread.deleteLater)
-
-                self.parallel_threads.append(thread)
-                self.parallel_workers.append(worker)
-
-
-        # Start everything
-        for thread in self.parallel_threads:
-            thread.start()
-
-        self.append_log(f"Parallel manual mode: started {len(self.parallel_workers)} worker(s).")
-
     def _on_parallel_noise_floor(self, value: float, label: str) -> None:
+        try:
+            now_ts = time.time()
+            for _did, _info in getattr(self, "_dev_workers", {}).items():
+                if str(_info.get("label")) == str(label):
+                    _band = str(_info.get("band") or "")
+                    if _band:
+                        self._band_last_activity_ts[_band] = now_ts
+                        try:
+                            self._band_rate_count[_band] = self._band_rate_count.get(_band, 0) + 1
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         self._noise_by_source[str(label)] = float(value)
         vals = list(self._noise_by_source.values())
         if vals:
             self.on_noise_floor_updated(sum(vals) / float(len(vals)))
-
-    def _on_parallel_worker_finished(self) -> None:
-        self._parallel_finished += 1
-        if self._parallel_finished >= max(1, len(self.parallel_workers)):
-            self.append_log("All parallel workers finished.")
-            self._cleanup_parallel()
-
-    def _cleanup_parallel(self) -> None:
-        # Ensure bias-tee is off on all devices we touched
-        if self.bias_tee_requested or self.bias_tee_engaged:
-            for serial in self.parallel_serials:
-                try:
-                    set_bias_tee(False, self.append_log, serial=serial)
-                except Exception:
-                    pass
-        # Stop and dispose QThreads cleanly (prevents 'QThread: Destroyed while thread is still running')
-        for thread in list(getattr(self, "parallel_threads", [])):
-            try:
-                if thread is not None and thread.isRunning():
-                    thread.quit()
-                    thread.wait(3000)
-            except Exception:
-                pass
-
-        self.bias_tee_requested = False
-        self.bias_tee_engaged = False
-
-        self._parallel_active = False
-        self.parallel_serials = []
-        self.parallel_workers = []
-        self.parallel_threads = []
-        self._noise_by_source = {}
-
-        self.status_label.setText("Idle")
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
 
     def _load_settings(self) -> None:
         s = QtCore.QSettings()
@@ -2610,13 +3568,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.dark_mode_checkbox.setChecked(dm_val)
         except Exception:
             self.dark_mode_checkbox.setChecked(True)
-
-        try:
-            mode = s.value("watchdog/mode", MODE_SINGLE)
-            if mode in (MODE_SINGLE, MODE_PARALLEL):
-                self.mode_combo.setCurrentText(str(mode))
-        except Exception:
-            pass
 
         try:
             dtype = s.value("watchdog/device_type", DEVICE_HACKRF)
@@ -2661,7 +3612,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Soapy params
         try:
-            self.soapy_args_edit.setText(str(s.value("watchdog/soapy_args", self.soapy_args_edit.text())))
             self.soapy_rate_spin.setValue(float(s.value("watchdog/soapy_rate_mhz", self.soapy_rate_spin.value())))
             self.soapy_bw_spin.setValue(float(s.value("watchdog/soapy_bw_mhz", self.soapy_bw_spin.value())))
             self.soapy_gain_spin.setValue(float(s.value("watchdog/soapy_gain_db", self.soapy_gain_spin.value())))
@@ -2693,16 +3643,27 @@ class MainWindow(QtWidgets.QMainWindow):
                             chosen = j
                             break
                 cb.setCurrentIndex(chosen)
+
+            def _to_bool(v) -> bool:
+                if isinstance(v, str):
+                    return v.strip().lower() in ("1", "true", "yes", "on")
+                return bool(v)
+
+            for band in ("A", "B", "C"):
+                card = self._band_cards.get(band, {})
+                sw = card.get("bias_switch")
+                if sw is None:
+                    continue
+                v = s.value(f"watchdog/band_bias_{band}", False)
+                sw.setChecked(_to_bool(v))
         except Exception:
             pass
 
-        self._on_mode_changed(0)
         self._on_device_type_changed(0)
     def _save_settings(self) -> None:
         try:
             s = QtCore.QSettings()
             s.setValue("watchdog/dark_mode", bool(self.dark_mode_checkbox.isChecked()))
-            s.setValue("watchdog/mode", str(self.mode_combo.currentText()))
             s.setValue("watchdog/device_type", str(self.device_type_combo.currentText()))
             s.setValue("watchdog/perf_preset", str(self.perf_combo.currentText()))
             s.setValue("watchdog/ui_refresh_ms", int(self.ui_refresh_spin.value()))
@@ -2714,8 +3675,11 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setValue("watchdog/band_assign_A", self._encode_assignment(self.bandA_device.currentData()))
             s.setValue("watchdog/band_assign_B", self._encode_assignment(self.bandB_device.currentData()))
             s.setValue("watchdog/band_assign_C", self._encode_assignment(self.bandC_device.currentData()))
-
-            s.setValue("watchdog/soapy_args", str(self.soapy_args_edit.text()))
+            for band in ("A", "B", "C"):
+                card = self._band_cards.get(band, {})
+                sw = card.get("bias_switch")
+                if sw is not None:
+                    s.setValue(f"watchdog/band_bias_{band}", bool(sw.isChecked()))
             s.setValue("watchdog/soapy_rate_mhz", float(self.soapy_rate_spin.value()))
             s.setValue("watchdog/soapy_bw_mhz", float(self.soapy_bw_spin.value()))
             s.setValue("watchdog/soapy_gain_db", float(self.soapy_gain_spin.value()))
@@ -2726,10 +3690,42 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        # Ensure all workers/threads are stopped before window is destroyed to avoid:
+        # "QThread: Destroyed while thread is still running"
         try:
             self.stop_watchdog()
         except Exception:
             pass
+
+        # Best-effort join of any remaining per-device threads
+        try:
+            for info in list(getattr(self, "_dev_workers", {}).values()):
+                th = info.get("thread") if isinstance(info, dict) else None
+                if th is None:
+                    continue
+                try:
+                    th.quit()
+                except Exception:
+                    pass
+                try:
+                    th.wait(1500)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(th, "isRunning") and th.isRunning():
+                        try:
+                            th.terminate()
+                        except Exception:
+                            pass
+                        try:
+                            th.wait(800)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         try:
             self._save_settings()
         except Exception:
@@ -2742,23 +3738,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_cal_changed(self):
         net = self.net_cal_offset_db()
         self.cal_net_label.setText(f"Net power offset: {net:+.1f} dB (gain − loss)")
-        if self.worker is not None:
-            self.worker.cal_gain_db = float(self.cal_gain_spin.value())
-            self.worker.cal_loss_db = float(self.cal_loss_spin.value())
         self.update_effective_threshold_label()
 
     def on_ppm_changed(self, value: float):
-        if self.worker is not None:
-            self.worker.freq_ppm = float(value)
+        _ = value
 
     def on_use_noise_floor_toggled(self, checked: bool):
-        if self.worker is not None:
-            self.worker.use_local_noise_floor = checked
+        _ = checked
         self.update_effective_threshold_label()
 
     def on_threshold_changed(self, value: float):
-        if self.worker is not None:
-            self.worker.threshold_db = float(value)
+        _ = value
         self.update_effective_threshold_label()
 
     def update_effective_threshold_label(self):
@@ -2784,8 +3774,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.bin_width_spin.setEnabled(not checked)
         self.max_bins_spin.setEnabled(checked)
 
-    def choose_auto_bin_width(self, bands: List[Dict[str, Any]]) -> int:
-        max_bins = self.max_bins_spin.value() or 400
+    def choose_auto_bin_width(self, bands: List[Dict[str, Any]], max_bins: int = 400) -> int:
+        max_bins = int(max_bins) if max_bins else 400
         max_span_hz = 0.0
         for b in bands:
             if not b.get("enabled", True):
@@ -2801,11 +3791,9 @@ class MainWindow(QtWidgets.QMainWindow):
         nice = int(round(raw_bin / 10_000.0)) * 10_000
         return nice if nice > 0 else 10_000
 
-    def play_alarm_sound(self):
-        if not self.beep_checkbox.isChecked():
-            return
 
-        mode = self.beep_sound_combo.currentData()
+    def _play_alarm_mode(self, mode: str):
+        """Play one alarm sound by mode key (system/soft_ding/short_chirp/alarm)."""
         if mode == "system" or mode is None:
             QtWidgets.QApplication.beep()
             return
@@ -2834,12 +3822,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sound_effects[mode] = effect
         effect.play()
 
-    def start_watchdog(self):
-        if self.worker is not None or self._parallel_active:
+    def play_alarm_sound(self):
+        """Global alarm (legacy/global controls)."""
+        if not self.beep_checkbox.isChecked():
             return
-        # STEP1: Mode/device selection is UI-only except for baseline HackRF single-SDR path.
-        mode = str(self.mode_combo.currentText())
-        dtype = str(self.device_type_combo.currentText())
+        self._play_alarm_mode(self.beep_sound_combo.currentData())
+
+    def play_alarm_sound_for_band(self, band: str):
+        """Per-band alarm: uses band card settings when present; falls back to global."""
+        card = self._band_cards.get(str(band), {}) if hasattr(self, "_band_cards") else {}
+        if card and "alarm_cb" in card and "alarm_combo" in card:
+            try:
+                if card["alarm_cb"].isChecked():
+                    self._play_alarm_mode(card["alarm_combo"].currentData())
+                    return
+            except Exception:
+                pass
+        self.play_alarm_sound()
+
+
+    def start_watchdog(self):
+        # Parallel-only runtime: Start means "Start all enabled bands",
+        # including bands not currently running.
         bands = []
         for name, enabled_cb, start_spin, stop_spin in [
             ("A", self.bandA_enable, self.bandA_start, self.bandA_stop),
@@ -2852,6 +3856,7 @@ class MainWindow(QtWidgets.QMainWindow):
             stop_mhz = stop_spin.value()
             if stop_mhz <= start_mhz:
                 continue
+            card = self._band_cards.get(name, {}) if hasattr(self, "_band_cards") else {}
             bands.append(
                 {
                     "name": name,
@@ -2860,6 +3865,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     "stop_mhz": stop_mhz,
                     "start_hz": start_mhz * 1e6,
                     "stop_hz": stop_mhz * 1e6,
+                    # Per-band detection overrides from band card (authoritative)
+                    "threshold_db": float(card["threshold_spin"].value()) if "threshold_spin" in card else None,
+                    "hold_time_s": float(card["hold_spin"].value()) if "hold_spin" in card else None,
+                    "use_noise_floor": bool(card["use_noise_cb"].isChecked()) if "use_noise_cb" in card else None,
+                    "only_show_above": bool(card["only_show_cb"].isChecked()) if "only_show_cb" in card else None,
                 }
             )
 
@@ -2882,88 +3892,30 @@ class MainWindow(QtWidgets.QMainWindow):
         # NOTE: Interval clamping for HackRF one-shot mode is handled inside SweepWorker.
         # In continuous mode, interval_ms=0 enables maximum processing rate.
         min_hold = float(self.persistence_spin.value())
-        device_arg = self.device_combo.currentData()
 
         antenna_power = self.bias_tee_checkbox.isChecked()
         cal_gain = float(self.cal_gain_spin.value())
         cal_loss = float(self.cal_loss_spin.value())
         ppm = float(self.ppm_spin.value())
 
-        self.detections.clear()
+        # Keep existing detections if we're already running (Start All can start missing bands).
+        if not self._parallel_is_active():
+            self.detections.clear()
+
         self.status_label.setText("Sweeping...")
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-
-        # Parallel mode (Step 3): manual per-band device assignment.
-        if mode == MODE_PARALLEL:
-            # Attach per-band assignment metadata
-            assign_map = {'A': self.bandA_device, 'B': self.bandB_device, 'C': self.bandC_device}
-            for b in bands:
-                cb = assign_map.get(str(b.get('name')))
-                if cb is not None:
-                    b['assign'] = cb.currentData()
-
-            any_assigned = False
-            for b in bands:
-                a = b.get('assign')
-                if isinstance(a, dict) and str(a.get('kind', 'auto')) != 'auto':
-                    any_assigned = True
-                    break
-
-            if not any_assigned:
-                # All bands set to Auto: keep the original HackRF round-robin behavior
-                self._start_parallel_hackrf(
-                    bands=bands,
-                    bin_width_hz=bin_width,
-                    threshold_db=threshold_db,
-                    use_local_noise_floor=use_noise_floor,
-                    only_above_threshold=only_above,
-                    min_hold_time_s=min_hold,
-                    interval_ms=interval_ms,
-                    antenna_power=antenna_power,
-                    cal_gain_db=cal_gain,
-                    cal_loss_db=cal_loss,
-                    freq_ppm=ppm,
-                )
-            else:
-                self._start_parallel_manual(
-                    bands=bands,
-                    bin_width_hz=bin_width,
-                    threshold_db=threshold_db,
-                    use_local_noise_floor=use_noise_floor,
-                    only_above_threshold=only_above,
-                    min_hold_time_s=min_hold,
-                    interval_ms=interval_ms,
-                    antenna_power=antenna_power,
-                    cal_gain_db=cal_gain,
-                    cal_loss_db=cal_loss,
-                    freq_ppm=ppm,
-                )
+        # Attach per-band assignment metadata
+        assign_map = {'A': self.bandA_device, 'B': self.bandB_device, 'C': self.bandC_device}
+        for b in bands:
+            cb = assign_map.get(str(b.get('name')))
+            if cb is not None:
+                b['assign'] = cb.currentData()
+        if not self._preflight_parallel_bands(bands):
+            self.status_label.setText("Idle")
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
             return
 
-        # Single mode SoapySDR backend (time-slice)
-        if mode == MODE_SINGLE and dtype == DEVICE_SOAPY:
-            self._start_single_soapy(
-                bands=bands,
-                bin_width_hz=bin_width,
-                threshold_db=threshold_db,
-                use_local_noise_floor=use_noise_floor,
-                only_above_threshold=only_above,
-                min_hold_time_s=min_hold,
-                interval_ms=interval_ms,
-                cal_gain_db=cal_gain,
-                cal_loss_db=cal_loss,
-                freq_ppm=ppm,
-            )
-            return
-
-        self.bias_tee_requested = bool(antenna_power)
-        self.bias_tee_engaged = False
-        if antenna_power:
-            self.bias_tee_engaged = set_bias_tee(True, self.append_log, serial=device_arg)
-
-        self.worker_thread = QtCore.QThread(self)
-        self.worker = SweepWorker(
+        self._parallel_start_all(
             bands=bands,
             bin_width_hz=bin_width,
             threshold_db=threshold_db,
@@ -2971,82 +3923,18 @@ class MainWindow(QtWidgets.QMainWindow):
             only_above_threshold=only_above,
             min_hold_time_s=min_hold,
             interval_ms=interval_ms,
-            device_arg=device_arg,
             antenna_power=antenna_power,
             cal_gain_db=cal_gain,
             cal_loss_db=cal_loss,
             freq_ppm=ppm,
         )
-        try:
-            self.worker.max_log_period_s = float(self._current_max_log_period_s())
-        except Exception:
-            pass
-        self.worker.moveToThread(self.worker_thread)
-
-        self.worker_thread.started.connect(self.worker.run)
-        self.worker.finished.connect(self.on_worker_finished)
-        self.worker.finished.connect(self.worker_thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
-
-        self.worker.log_message.connect(self.append_log)
-        self.worker.noise_floor_updated.connect(self.on_noise_floor_updated)
-        self.worker.detections_found.connect(self.on_detections_found)
-
-        self.worker_thread.start()
-        self.append_log("Starting watchdog...")
 
     def stop_watchdog(self):
-        if self._parallel_active:
-            self.append_log("Stopping watchdog (parallel)...")
-            self.status_label.setText("Stopping...")
-
-            for w in list(self.parallel_workers):
-                try:
-                    w.stop()
-                except Exception:
-                    pass
-
-            # Turn off bias-tee on all used devices immediately
-            if self.bias_tee_requested or self.bias_tee_engaged:
-                for serial in self.parallel_serials:
-                    try:
-                        set_bias_tee(False, self.append_log, serial=serial)
-                    except Exception:
-                        pass
-                self.bias_tee_requested = False
-                self.bias_tee_engaged = False
-
+        # Parallel per-device stop
+        if self._parallel_is_active():
+            self._parallel_stop_all()
             return
-
-        if self.worker is not None:
-            self.append_log("Stopping watchdog...")
-            self.status_label.setText("Stopping...")
-            self.worker.stop()
-
-        if self.bias_tee_requested:
-            device_arg = self.device_combo.currentData()
-            set_bias_tee(False, self.append_log, serial=device_arg)
-            self.bias_tee_engaged = False
-            self.bias_tee_requested = False
-
-        if self.worker is None:
-            self.status_label.setText("Idle")
-
-    def on_worker_finished(self):
-        self.append_log("Worker finished.")
-
-        if self.bias_tee_requested or self.bias_tee_engaged:
-            device_arg = self.device_combo.currentData()
-            set_bias_tee(False, self.append_log, serial=device_arg)
-            self.bias_tee_requested = False
-            self.bias_tee_engaged = False
-
         self.status_label.setText("Idle")
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.worker = None
-        self.worker_thread = None
 
     @QtCore.pyqtSlot(float)
     def on_noise_floor_updated(self, value: float):
@@ -3064,8 +3952,33 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 existing["timestamp"] = d["timestamp"]
 
+        # Per-band alarm routing (falls back to global)
         if detections:
-            self.play_alarm_sound()
+            # Backend activity marker (used by per-band status line)
+            try:
+                now_ts = time.time()
+                for _d in detections:
+                    _b = _d.get("band")
+                    if _b is not None:
+                        _b = str(_b).strip()
+                        if _b:
+                            self._band_last_activity_ts[_b] = now_ts
+            except Exception:
+                pass
+
+            bands = []
+            for d in detections:
+                b = d.get("band")
+                if b is None:
+                    continue
+                b = str(b).strip()
+                if b:
+                    bands.append(b)
+            if bands:
+                for b in sorted(set(bands)):
+                    self.play_alarm_sound_for_band(b)
+            else:
+                self.play_alarm_sound()
 
         for d in detections:
             try:
@@ -3074,6 +3987,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.append_log(f"ATAK send error: {e}")
 
     def refresh_detection_table(self):
+
         now = time.time()
         items = sorted(self.detections.items(), key=lambda kv: kv[1]["timestamp"], reverse=True)
         self.table.setRowCount(len(items))
@@ -3173,7 +4087,20 @@ class MainWindow(QtWidgets.QMainWindow):
                     background-color: #333; color: #eee; border: 1px solid #555;
                 }
                 QHeaderView::section { background-color: #333; color: #eee; }
-                QPushButton { background-color: #444; color: #eee; border: 1px solid #666; padding: 3px 8px; }
+                QPushButton, QToolButton {
+                    background-color: #444;
+                    color: #eee;
+                    border: 1px solid #666;
+                    padding: 4px 8px;
+                    border-radius: 3px;
+                }
+                QPushButton:hover, QToolButton:hover { background-color: #505050; }
+                QPushButton:pressed, QToolButton:pressed {
+                    background-color: #2f2f2f;
+                    border: 1px solid #8a8a8a;
+                    padding-top: 5px;
+                    padding-bottom: 3px;
+                }
                 QPushButton:disabled { background-color: #333; color: #777; }
                 """
             )
@@ -3188,9 +4115,21 @@ class MainWindow(QtWidgets.QMainWindow):
                     background-color: #ffffff; color: #111; border: 1px solid #bdbdbd;
                 }
                 QHeaderView::section { background-color: #e9e9e9; color: #111; border: 1px solid #cfcfcf; }
-                QPushButton { background-color: #e9e9e9; color: #111; border: 1px solid #bdbdbd; padding: 4px 8px; }
-                QPushButton:pressed { background-color: #dcdcdc; }
-                QPushButton:disabled { background-color: #efefef; color: #999; }
+                QPushButton, QToolButton {
+                    background-color: #e9e9e9;
+                    color: #111;
+                    border: 1px solid #bdbdbd;
+                    padding: 4px 8px;
+                    border-radius: 3px;
+                }
+                QPushButton:hover, QToolButton:hover { background-color: #e1e1e1; }
+                QPushButton:pressed, QToolButton:pressed {
+                    background-color: #d3d3d3;
+                    border: 1px solid #9f9f9f;
+                    padding-top: 5px;
+                    padding-bottom: 3px;
+                }
+                QPushButton:disabled, QToolButton:disabled { background-color: #efefef; color: #999; }
                 QCheckBox { color: #111; }
                 """
             )
@@ -3203,21 +4142,10 @@ class MainWindow(QtWidgets.QMainWindow):
         busy_hackrf = set()
         busy_soapy = set()
 
-        w = getattr(self, "worker", None)
-        if w is not None:
-            try:
-                if isinstance(w, SweepWorker):
-                    serial = str(getattr(w, "device_arg", "") or getattr(w, "source_id", "") or "").strip()
-                    if serial:
-                        busy_hackrf.add(serial)
-                elif isinstance(w, SoapyTimeSliceWorker):
-                    args = str(getattr(w, "soapy_args", "") or "").strip()
-                    if args:
-                        busy_soapy.add(args)
-            except Exception:
-                pass
-
-        for w in getattr(self, "parallel_workers", []) or []:
+        for info in getattr(self, "_dev_workers", {}).values():
+            w = info.get("worker") if isinstance(info, dict) else None
+            if w is None:
+                continue
             try:
                 if isinstance(w, SweepWorker):
                     serial = str(getattr(w, "device_arg", "") or getattr(w, "source_id", "") or "").strip()
@@ -3285,8 +4213,8 @@ def main():
     try:
         app = QtWidgets.QApplication(sys.argv)
         app.setStyle("Fusion")
-        app.setOrganizationName("HackRF-Watchdog")
-        app.setApplicationName("HackRF-Watchdog")
+        app.setOrganizationName("Watchdog")
+        app.setApplicationName("Watchdog")
 
         win = MainWindow()
         win.resize(1200, 800)
