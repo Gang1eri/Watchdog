@@ -20,7 +20,7 @@ Install Python 3.x from python.org and ensure “Add Python to PATH” is checke
 Download/clone this repo, then in PowerShell:
 
 ```powershell
-cd path\to\HackRF-Watchdog
+cd path\to\Watchdog
 python -m venv .venv
 .\.venv\Scripts\activate
 python -m pip install -U pip
